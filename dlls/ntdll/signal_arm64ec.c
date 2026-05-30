@@ -717,19 +717,33 @@ NTSTATUS SYSCALL_API NtGetContextThread( HANDLE handle, CONTEXT *context )
     return status;
 }
 
+static BOOL is_executable_protect( ULONG protect )
+{
+    return !!(protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY));
+}
+
 static void notify_map_view_of_section( HANDLE handle, void *addr, SIZE_T size, ULONG alloc,
                                         ULONG protect, NTSTATUS *ret_status )
 {
     SECTION_IMAGE_INFORMATION info;
     NTSTATUS status;
 
-    if (!pNotifyMapViewOfSection) return;
-    if (!NtCurrentTeb()->Tib.ArbitraryUserPointer) return;
-    if (NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL )) return;
-    status = pNotifyMapViewOfSection( NULL, addr, NULL, size, alloc, protect );
-    if (NT_SUCCESS(status)) return;
-    NtUnmapViewOfSection( GetCurrentProcess(), addr );
-    *ret_status = status;
+    if (!NtQuerySection( handle, SectionImageInformation, &info, sizeof(info), NULL ))
+    {
+        if (!pNotifyMapViewOfSection) return;
+        if (!NtCurrentTeb()->Tib.ArbitraryUserPointer) return;
+        status = pNotifyMapViewOfSection( NULL, addr, NULL, size, alloc, protect );
+        if (NT_SUCCESS(status)) return;
+        NtUnmapViewOfSection( GetCurrentProcess(), addr );
+        *ret_status = status;
+        return;
+    }
+
+    if (!pNotifyMemoryProtect || !size || !is_executable_protect( protect )) return;
+    ERR( "wine.mapview.exec-protect-shim addr=%p size=%Iu protect=%#lx alloc=%#lx status=%#lx\n",
+         addr, size, (unsigned long)protect, (unsigned long)alloc, (unsigned long)STATUS_SUCCESS );
+    pNotifyMemoryProtect( addr, size, protect, TRUE, STATUS_SUCCESS );
 }
 
 NTSTATUS SYSCALL_API NtMapViewOfSection( HANDLE handle, HANDLE process, PVOID *addr_ptr,
