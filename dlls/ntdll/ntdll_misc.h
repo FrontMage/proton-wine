@@ -66,6 +66,7 @@ extern LONG WINAPI call_unhandled_exception_filter( PEXCEPTION_POINTERS eptr );
 extern void register_module_exception_directory( void *module );
 extern void unregister_module_exception_directory( void *module );
 extern void WINAPI process_breakpoint(void);
+extern void arm_probe_dump_pe_ring(void);
 
 static inline BOOL is_valid_frame( ULONG_PTR frame )
 {

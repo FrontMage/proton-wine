@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
 #ifdef HAVE_SYS_PARAM_H
@@ -54,6 +55,7 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
+#include "winbase.h"
 #include "winnt.h"
 #include "winternl.h"
 #include "wine/asm.h"
@@ -61,6 +63,17 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
+
+#define ARM_PROBE_UNIX_RING_CAPACITY 256
+#define ARM_PROBE_UNIX_RING_LINE     256
+
+static LONG arm_probe_unix_cfg_state = -1;
+static BOOL arm_probe_unix_stdio_flag;
+static BOOL arm_probe_unix_ring_flag;
+static BOOL arm_probe_unix_target_flag;
+static LONG arm_probe_unix_ring_count;
+static char arm_probe_unix_ring_buffer[ARM_PROBE_UNIX_RING_CAPACITY][ARM_PROBE_UNIX_RING_LINE];
+static pthread_once_t arm_probe_unix_atexit_once = PTHREAD_ONCE_INIT;
 
 #define NTDLL_DWARF_H_NO_UNWINDER
 #include "dwarf.h"
@@ -75,6 +88,145 @@ C_ASSERT( sizeof(struct arm64_thread_data) <= sizeof(((struct ntdll_thread_data 
 static inline struct arm64_thread_data *arm64_thread_data(void)
 {
     return (struct arm64_thread_data *)ntdll_get_thread_data()->cpu_data;
+}
+
+static BOOL arm_probe_path_matches( const WCHAR *name, const WCHAR *prefix )
+{
+    while (*prefix)
+    {
+        WCHAR a = *name++;
+        WCHAR b = *prefix++;
+
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+static void arm_probe_unix_dump_ring(void)
+{
+    LONG total, start, i;
+
+    if (!arm_probe_unix_ring_flag || !arm_probe_unix_target_flag) return;
+    total = arm_probe_unix_ring_count;
+    if (total <= 0) return;
+    start = total > ARM_PROBE_UNIX_RING_CAPACITY ? total - ARM_PROBE_UNIX_RING_CAPACITY : 0;
+    for (i = start; i < total; ++i)
+    {
+        const char *line = arm_probe_unix_ring_buffer[i % ARM_PROBE_UNIX_RING_CAPACITY];
+        if (line[0]) write( 2, line, strlen( line ) );
+    }
+}
+
+static void arm_probe_unix_register_atexit(void)
+{
+    atexit( arm_probe_unix_dump_ring );
+}
+
+static void arm_probe_unix_init_config(void)
+{
+    const char *value;
+    static const WCHAR probe_prefix[] = {'p','r','o','b','e','_',0};
+    static const WCHAR wow_arm_name[] = {'W','o','w','C','l','a','s','s','i','c','-','a','r','m','6','4','.','e','x','e',0};
+    WCHAR *image;
+    ULONG len;
+
+    if (arm_probe_unix_cfg_state != -1) return;
+
+    value = getenv( "WINE_ARM_PROBE_EXCEPTION_STDIO" );
+    arm_probe_unix_stdio_flag = value && value[0] != '0';
+    value = getenv( "WINE_ARM_PROBE_EXCEPTION_RING" );
+    arm_probe_unix_ring_flag = value && value[0] != '0';
+    arm_probe_unix_target_flag = FALSE;
+
+    if (NtCurrentTeb()->Peb && NtCurrentTeb()->Peb->ProcessParameters)
+    {
+        image = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+        len = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Length / sizeof(WCHAR);
+        while (len && image[len - 1] != '\\' && image[len - 1] != '/') len--;
+        image += len;
+        if (arm_probe_path_matches( image, probe_prefix ) ||
+            arm_probe_path_matches( image, wow_arm_name ))
+            arm_probe_unix_target_flag = TRUE;
+    }
+    if (arm_probe_unix_ring_flag) pthread_once( &arm_probe_unix_atexit_once, arm_probe_unix_register_atexit );
+    arm_probe_unix_cfg_state = 1;
+}
+
+BOOL arm_probe_unix_should_log(void)
+{
+    arm_probe_unix_init_config();
+    return arm_probe_unix_target_flag && (arm_probe_unix_stdio_flag || arm_probe_unix_ring_flag);
+}
+
+BOOL arm_probe_unix_stdio_enabled(void)
+{
+    arm_probe_unix_init_config();
+    return arm_probe_unix_target_flag && arm_probe_unix_stdio_flag;
+}
+
+BOOL arm_probe_unix_ring_enabled(void)
+{
+    arm_probe_unix_init_config();
+    return arm_probe_unix_target_flag && arm_probe_unix_ring_flag;
+}
+
+static void arm_probe_unix_emit_line( const char *line )
+{
+    LONG idx;
+
+    if (arm_probe_unix_ring_flag)
+    {
+        idx = InterlockedIncrement( &arm_probe_unix_ring_count ) - 1;
+        snprintf( arm_probe_unix_ring_buffer[idx % ARM_PROBE_UNIX_RING_CAPACITY],
+                  ARM_PROBE_UNIX_RING_LINE, "%s", line );
+    }
+    if (arm_probe_unix_stdio_flag) write( 2, line, strlen( line ) );
+}
+
+static void arm_probe_unix_logf( const char *tag, const char *fmt, ... )
+{
+    char buffer[ARM_PROBE_UNIX_RING_LINE];
+    int len;
+    va_list ap;
+
+    if (!arm_probe_unix_should_log()) return;
+    len = snprintf( buffer, sizeof(buffer), "[%s] ", tag );
+    if (len < 0 || len >= sizeof(buffer)) return;
+    va_start( ap, fmt );
+    len += vsnprintf( buffer + len, sizeof(buffer) - len, fmt, ap );
+    va_end( ap );
+    if (len < 0) return;
+    buffer[ARRAY_SIZE(buffer) - 1] = 0;
+    arm_probe_unix_emit_line( buffer );
+}
+
+void arm_probe_unix_log_exception( const char *tag, DWORD code, void *addr, DWORD count,
+                                   ULONG_PTR info0, ULONG_PTR info1, DWORD64 pc, DWORD64 lr,
+                                   DWORD64 sp, DWORD cpsr )
+{
+    arm_probe_unix_logf( tag,
+                         "code=%08lx addr=%p params=%lu info0=%p info1=%p pc=%016lx lr=%016lx sp=%016lx cpsr=%08lx\n",
+                         code, addr, count, (void *)info0, (void *)info1, pc, lr, sp, cpsr );
+}
+
+void arm_probe_unix_log_continue( const char *tag, const CONTEXT *context, DWORD64 x18,
+                                  DWORD64 x19, DWORD64 x20, DWORD64 x21, DWORD64 x22,
+                                  DWORD64 x23, DWORD64 x24, DWORD64 x25, DWORD64 x26,
+                                  DWORD64 x27, DWORD64 x28 )
+{
+    if (!arm_probe_unix_should_log()) return;
+    arm_probe_unix_logf( tag,
+                         "pc=%016llx lr=%016llx sp=%016llx cpsr=%08lx x18=%016llx x19=%016llx x20=%016llx x21=%016llx x22=%016llx x23=%016llx x24=%016llx x25=%016llx x26=%016llx x27=%016llx x28=%016llx\n",
+                         (unsigned long long)context->Pc, (unsigned long long)context->Lr,
+                         (unsigned long long)context->Sp, context->Cpsr,
+                         (unsigned long long)x18, (unsigned long long)x19,
+                         (unsigned long long)x20, (unsigned long long)x21,
+                         (unsigned long long)x22, (unsigned long long)x23,
+                         (unsigned long long)x24, (unsigned long long)x25,
+                         (unsigned long long)x26, (unsigned long long)x27,
+                         (unsigned long long)x28 );
 }
 
 /***********************************************************************
@@ -349,6 +501,11 @@ NTSTATUS signal_set_full_context( CONTEXT *context )
     struct syscall_frame *frame = get_syscall_frame();
     NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
 
+    arm_probe_unix_log_continue( "ARMPROBE-UNIX-SIGNAL-SET", context,
+                                 context->X18, context->X19, context->X20, context->X21,
+                                 context->X22, context->X23, context->X24, context->X25,
+                                 context->X26, context->X27, context->X28 );
+
     if (is_arm64ec_suspend_doorbell_valid() && arm64_thread_data()->suspend_pending)
     {
         CONTEXT suspend_context;
@@ -439,6 +596,10 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     }
     if (flags & CONTEXT_DEBUG_REGISTERS) FIXME( "debug registers not supported\n" );
     frame->restore_flags |= flags & ~CONTEXT_INTEGER;
+    arm_probe_unix_log_continue( "ARMPROBE-UNIX-SETCTX", context,
+                                 frame->x[18], frame->x[19], frame->x[20], frame->x[21],
+                                 frame->x[22], frame->x[23], frame->x[24], frame->x[25],
+                                 frame->x[26], frame->x[27], frame->x[28] );
     return STATUS_SUCCESS;
 }
 
@@ -1146,6 +1307,7 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     EXCEPTION_RECORD rec = { EXCEPTION_ILLEGAL_INSTRUCTION };
     ucontext_t *context = sigcontext;
+    DWORD64 esr = get_fault_esr( context );
 
     if (!(PSTATE_sig( context ) & 0x10) && /* AArch64 (not WoW) */
         !(PC_sig( context ) & 3))
@@ -1161,6 +1323,13 @@ static void ill_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         }
     }
 
+    arm_probe_unix_logf( "ARMPROBE-UNIX-ILL",
+                         "code=%08lx addr=%p params=%lu info0=%p info1=%p pc=%016lx lr=%016lx sp=%016lx cpsr=%08lx esr=%016lx instr=%08x\n",
+                         rec.ExceptionCode, (void *)PC_sig(context), rec.NumberParameters,
+                         (void *)rec.ExceptionInformation[0], (void *)rec.ExceptionInformation[1],
+                         (DWORD64)PC_sig(context), (DWORD64)LR_sig(context), (DWORD64)SP_sig(context),
+                         (DWORD)PSTATE_sig(context), esr,
+                         (!(PSTATE_sig(context) & 0x10) && !(PC_sig(context) & 3)) ? *(ULONG *)PC_sig(context) : 0 );
     setup_exception( sigcontext, &rec );
 }
 
@@ -1234,6 +1403,9 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         break;
     }
 
+    arm_probe_unix_log_exception( "ARMPROBE-UNIX-TRAP", rec.ExceptionCode, rec.ExceptionAddress,
+                                  rec.NumberParameters, rec.ExceptionInformation[0],
+                                  rec.ExceptionInformation[1], ctx.Pc, ctx.Lr, ctx.Sp, ctx.Cpsr );
     setup_raise_exception( sigcontext, &rec, &ctx );
 }
 

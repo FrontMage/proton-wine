@@ -872,6 +872,10 @@ NTSTATUS WINAPI NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
         status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, 0, NULL, &apc );
         if (status == STATUS_USER_APC) return invoke_user_apc( context, &apc, status );
     }
+    arm_probe_unix_log_continue( "ARMPROBE-UNIX-NTCONT", context,
+                                 context->X18, context->X19, context->X20, context->X21,
+                                 context->X22, context->X23, context->X24, context->X25,
+                                 context->X26, context->X27, context->X28 );
     return signal_set_full_context( context );
 }
 

@@ -22,11 +22,14 @@
 #include <assert.h>
 #include <errno.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdarg.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
+#include "winbase.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
 #include "wine/exception.h"
@@ -59,6 +62,16 @@ static RTL_CRITICAL_SECTION_DEBUG critsect_debug =
 static RTL_CRITICAL_SECTION vectored_handlers_section = { &critsect_debug, -1, 0, 0, 0, 0 };
 
 static PRTL_EXCEPTION_FILTER unhandled_exception_filter;
+
+#define ARM_PROBE_RING_CAPACITY 256
+#define ARM_PROBE_RING_LINE     256
+
+static LONG arm_probe_cfg_state = -1;
+static BOOL arm_probe_stdio;
+static BOOL arm_probe_ring;
+static BOOL arm_probe_target;
+static LONG arm_probe_ring_count;
+static char arm_probe_ring_buffer[ARM_PROBE_RING_CAPACITY][ARM_PROBE_RING_LINE];
 
 static const char *debugstr_exception_code( DWORD code )
 {
@@ -97,6 +110,113 @@ static const char *debugstr_exception_code( DWORD code )
     case RPC_S_SERVER_UNAVAILABLE: return "RPC_S_SERVER_UNAVAILABLE";
     }
     return "unknown";
+}
+
+static BOOL arm_probe_path_matches( const WCHAR *name, const WCHAR *prefix )
+{
+    while (*prefix)
+    {
+        WCHAR a = *name++;
+        WCHAR b = *prefix++;
+
+        if (a >= 'A' && a <= 'Z') a += 'a' - 'A';
+        if (b >= 'A' && b <= 'Z') b += 'a' - 'A';
+        if (a != b) return FALSE;
+    }
+    return TRUE;
+}
+
+static void arm_probe_init_config(void)
+{
+    WCHAR value[8];
+    static const WCHAR stdio_name[] = {'W','I','N','E','_','A','R','M','_','P','R','O','B','E','_','E','X','C','E','P','T','I','O','N','_','S','T','D','I','O',0};
+    static const WCHAR ring_name[]  = {'W','I','N','E','_','A','R','M','_','P','R','O','B','E','_','E','X','C','E','P','T','I','O','N','_','R','I','N','G',0};
+    WCHAR *image;
+    ULONG len;
+    UNICODE_STRING name, env_value;
+
+    if (arm_probe_cfg_state != -1) return;
+
+    name.Buffer = (WCHAR *)stdio_name;
+    name.Length = name.MaximumLength = sizeof(stdio_name) - sizeof(WCHAR);
+    env_value.Buffer = value;
+    env_value.Length = 0;
+    env_value.MaximumLength = sizeof(value) - sizeof(WCHAR);
+    arm_probe_stdio = !RtlQueryEnvironmentVariable_U( NULL, &name, &env_value ) && value[0] != '0';
+
+    name.Buffer = (WCHAR *)ring_name;
+    name.Length = name.MaximumLength = sizeof(ring_name) - sizeof(WCHAR);
+    env_value.Buffer = value;
+    env_value.Length = 0;
+    env_value.MaximumLength = sizeof(value) - sizeof(WCHAR);
+    arm_probe_ring = !RtlQueryEnvironmentVariable_U( NULL, &name, &env_value ) && value[0] != '0';
+    arm_probe_target = FALSE;
+
+    if (NtCurrentTeb()->Peb && NtCurrentTeb()->Peb->ProcessParameters)
+    {
+        image = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Buffer;
+        len = NtCurrentTeb()->Peb->ProcessParameters->ImagePathName.Length / sizeof(WCHAR);
+        while (len && image[len - 1] != '\\' && image[len - 1] != '/') len--;
+        image += len;
+        if (arm_probe_path_matches( image, L"probe_" ) ||
+            arm_probe_path_matches( image, L"WowClassic-arm64.exe" ))
+            arm_probe_target = TRUE;
+    }
+    arm_probe_cfg_state = 1;
+}
+
+static BOOL arm_probe_pe_should_log(void)
+{
+    arm_probe_init_config();
+    return arm_probe_target && (arm_probe_stdio || arm_probe_ring);
+}
+
+static void arm_probe_pe_emit_line( const char *line )
+{
+    LONG idx;
+
+    if (arm_probe_ring)
+    {
+        idx = InterlockedIncrement( &arm_probe_ring_count ) - 1;
+        snprintf( arm_probe_ring_buffer[idx % ARM_PROBE_RING_CAPACITY], ARM_PROBE_RING_LINE, "%s", line );
+    }
+    if (arm_probe_stdio) __wine_dbg_write( line, strlen( line ) );
+}
+
+static void arm_probe_pe_logf( const char *tag, const char *fmt, ... )
+{
+    char buffer[ARM_PROBE_RING_LINE];
+    int len;
+    va_list ap;
+
+    if (!arm_probe_pe_should_log()) return;
+
+    len = snprintf( buffer, sizeof(buffer), "[%s] ", tag );
+    if (len < 0 || len >= sizeof(buffer)) return;
+    va_start( ap, fmt );
+    len += vsnprintf( buffer + len, sizeof(buffer) - len, fmt, ap );
+    va_end( ap );
+    if (len < 0) return;
+    buffer[ARRAY_SIZE(buffer) - 1] = 0;
+    arm_probe_pe_emit_line( buffer );
+}
+
+void arm_probe_dump_pe_ring(void)
+{
+    LONG total, start, i;
+
+    arm_probe_init_config();
+    if (!arm_probe_ring || !arm_probe_target) return;
+
+    total = arm_probe_ring_count;
+    if (total <= 0) return;
+    start = total > ARM_PROBE_RING_CAPACITY ? total - ARM_PROBE_RING_CAPACITY : 0;
+
+    for (i = start; i < total; ++i)
+    {
+        const char *line = arm_probe_ring_buffer[i % ARM_PROBE_RING_CAPACITY];
+        if (line[0]) __wine_dbg_write( line, strlen( line ) );
+    }
 }
 
 
@@ -265,8 +385,37 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
         TRACE( " info[%ld]=%p\n", i, (void *)rec->ExceptionInformation[i] );
     TRACE_CONTEXT( context );
 
+    if (arm_probe_pe_should_log()
+#if defined(__aarch64__) && !defined(__arm64ec__)
+        )
+        arm_probe_pe_logf( "ARMPROBE-PE-EXC",
+                           "event=dispatch code=%08lx addr=%p params=%lu info0=%p info1=%p pc=%016I64x lr=%016I64x sp=%016I64x cpsr=%08lx x18=%016I64x x19=%016I64x x20=%016I64x x21=%016I64x\n",
+                           rec->ExceptionCode, rec->ExceptionAddress, rec->NumberParameters,
+                           (void *)rec->ExceptionInformation[0], (void *)rec->ExceptionInformation[1],
+                           context->Pc, context->Lr, context->Sp, context->Cpsr,
+                           context->X18, context->X19, context->X20, context->X21 );
+#else
+        )
+            ;
+#endif
+
     if (call_vectored_handlers( rec, context ) == EXCEPTION_CONTINUE_EXECUTION)
+    {
+        if (arm_probe_pe_should_log()
+#if defined(__aarch64__) && !defined(__arm64ec__)
+            )
+            arm_probe_pe_logf( "ARMPROBE-PE-CONT",
+                               "event=consumed-vectored code=%08lx next_pc=%016I64x next_lr=%016I64x next_sp=%016I64x next_cpsr=%08lx x18=%016I64x x19=%016I64x x20=%016I64x x21=%016I64x x22=%016I64x x23=%016I64x x24=%016I64x x25=%016I64x x26=%016I64x x27=%016I64x x28=%016I64x\n",
+                               rec->ExceptionCode, context->Pc, context->Lr, context->Sp, context->Cpsr,
+                               context->X18, context->X19, context->X20, context->X21, context->X22,
+                               context->X23, context->X24, context->X25, context->X26, context->X27,
+                               context->X28 );
+#else
+            )
+                ;
+#endif
         NtContinue( context, FALSE );
+    }
 
     if ((status = call_seh_handlers( rec, context )) == STATUS_SUCCESS)
         NtContinue( context, FALSE );

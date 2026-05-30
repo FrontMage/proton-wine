@@ -221,6 +221,16 @@ extern BOOL fsync_simulate_sched_quantum;
 extern BOOL fsync_yield_to_waiters;
 
 extern BOOL ac_odyssey;
+extern void arm_probe_unix_log_exception( const char *tag, DWORD code, void *addr, DWORD count,
+                                          ULONG_PTR info0, ULONG_PTR info1, DWORD64 pc, DWORD64 lr,
+                                          DWORD64 sp, DWORD cpsr );
+extern void arm_probe_unix_log_continue( const char *tag, const CONTEXT *context, DWORD64 x18,
+                                         DWORD64 x19, DWORD64 x20, DWORD64 x21, DWORD64 x22,
+                                         DWORD64 x23, DWORD64 x24, DWORD64 x25, DWORD64 x26,
+                                         DWORD64 x27, DWORD64 x28 );
+extern BOOL arm_probe_unix_should_log(void);
+extern BOOL arm_probe_unix_stdio_enabled(void);
+extern BOOL arm_probe_unix_ring_enabled(void);
 
 extern void init_environment(void);
 extern void init_startup_info(void);

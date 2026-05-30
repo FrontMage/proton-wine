@@ -4111,6 +4111,7 @@ void WINAPI LdrShutdownProcess(void)
     if (!detaching)
         RtlProcessFlsData( NtCurrentTeb()->FlsSlots, 1 );
 
+    arm_probe_dump_pe_ring();
     process_detach();
 }
 
