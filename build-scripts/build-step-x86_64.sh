@@ -75,7 +75,8 @@ do
             cp build-x86_64/libandroid-sysvshm.so "$deps/lib/"
             echo "Copied libandroid-sysvshm.so to $deps/lib/"
         else
-            echo "Warning: android_sysvshm build failed"
+            echo "android_sysvshm build failed" >&2
+            exit 1
         fi
         cd "$PROJECT_ROOT"
     fi
@@ -83,6 +84,10 @@ do
 
   if [ "$arg" == "--configure" ];
   then
+    export PATCH_STATUS_PATH="${PATCH_STATUS_PATH:-$PWD/patch-status.tsv}"
+    bash build-scripts/apply-android-patches-strict.sh
+    ANDROID_PATCHES_PREAPPLIED=1
+
     ./configure \
       --enable-archs=$WIN_ARCH \
       --host=$TARGET \
@@ -142,6 +147,7 @@ do
       --without-xshm \
       --without-xxf86vm
 
+    if [ "${ANDROID_PATCHES_PREAPPLIED:-0}" != "1" ]; then
     echo "Applying patches..."
 
     PATCHES=(
@@ -229,16 +235,19 @@ do
         if git apply "./android/patches/$patch"; then
           echo "SUCCESS: $patch applied"
         else
-          echo "FAILED: error applying $patch"
+          echo "FAILED: error applying $patch" >&2
+          exit 1
         fi
       else
-        echo "SKIPPED: $patch does not apply cleanly"
+        echo "FAILED: $patch does not apply cleanly" >&2
         git apply --check "./android/patches/$patch"
+        exit 1
       fi
     done
 
     echo "----------------------------------------"
     echo "Done applying patches."
+    fi
   fi
 
   if [ "$arg" == "--build" ]
@@ -248,7 +257,7 @@ do
     rm -rf $OUTPUT_DIR/lib
     rm -rf $OUTPUT_DIR/share
     rm -rf $install_dir
-    make -j$(nproc)
+    make -j"${JOBS:-12}"
   fi
 
   if [ "$arg" == "--install" ]
@@ -258,7 +267,7 @@ do
     mkdir -p $OUTPUT_DIR/lib
     mkdir -p $OUTPUT_DIR/share
     mkdir -p $install_dir
-    make install -j$(nproc)
+    make install -j"${JOBS:-12}"
     echo "Copying files..."
     cp -r $install_dir/bin/wine* $OUTPUT_DIR/bin
     cp -r $install_dir/bin/reg* $OUTPUT_DIR/bin
