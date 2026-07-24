@@ -114,7 +114,13 @@ struct apply_arm64x_read_fixups_params
     void    *buffer;
     SIZE_T   size;
     LONGLONG offset;
+    ULONG_PTR live_module_base;
+    ULONG    live_module_size;
+    ULONG    live_module_timestamp;
+    ULONG    flags;
 };
+
+#define ARM64X_READ_FIXUP_LIVE_NTDLL_VIEW 0x00000001
 
 enum ntdll_unix_funcs
 {

@@ -66,6 +66,9 @@ static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
 
 static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
 static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
+static HMODULE live_ntdll_base;
+static ULONG live_ntdll_size;
+static ULONG live_ntdll_timestamp;
 extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispatcher");
 
 static inline CHPE_V2_CPU_AREA_INFO *get_arm64ec_cpu_area(void)
@@ -189,6 +192,7 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     NTSTATUS status = STATUS_SUCCESS;
     CHPEV2_PROCESS_INFO *info = (CHPEV2_PROCESS_INFO *)(RtlGetCurrentPeb() + 1);
     const IMAGE_ARM64EC_METADATA *metadata = arm64ec_get_module_metadata( module );
+    IMAGE_NT_HEADERS *nt;
 
     __os_arm64x_dispatch_call_no_redirect = RtlFindExportedRoutineByName( module, "ExitToX64" );
     __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
@@ -214,6 +218,20 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     GET_PTR( ThreadTerm );
     GET_PTR( UpdateProcessorInformation );
 #undef GET_PTR
+
+    if (RtlPcToFileHeader( LdrInitializeThunk, (void **)&live_ntdll_base ) &&
+        (nt = RtlImageNtHeader( live_ntdll_base )) &&
+        nt->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        live_ntdll_size = nt->OptionalHeader.SizeOfImage;
+        live_ntdll_timestamp = nt->FileHeader.TimeDateStamp;
+    }
+    else
+    {
+        live_ntdll_base = NULL;
+        live_ntdll_size = 0;
+        live_ntdll_timestamp = 0;
+    }
 
     RtlGetCurrentPeb()->ChpeV2ProcessInfo = info;
     info->NativeMachineType = IMAGE_FILE_MACHINE_ARM64;
@@ -820,6 +838,10 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
         .handle = handle,
         .buffer = buffer,
         .offset = offset && offset->QuadPart >= 0 ? offset->QuadPart : -1,
+        .live_module_base = (ULONG_PTR)live_ntdll_base,
+        .live_module_size = live_ntdll_size,
+        .live_module_timestamp = live_ntdll_timestamp,
+        .flags = live_ntdll_base ? ARM64X_READ_FIXUP_LIVE_NTDLL_VIEW : 0,
     };
     NTSTATUS status;
 

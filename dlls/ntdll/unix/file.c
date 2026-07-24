@@ -6739,7 +6739,7 @@ NTSTATUS unixcall_apply_arm64x_read_fixups( void *args )
     if (!server_get_unix_fd( params->handle, FILE_READ_DATA, &fd, &needs_close, &type, NULL ))
     {
         if (type == FD_TYPE_FILE)
-            virtual_apply_arm64x_read_fixups( fd, params->buffer, params->size, params->offset );
+            virtual_apply_arm64x_read_fixups( fd, params );
         if (needs_close) close( fd );
     }
     return STATUS_SUCCESS;

@@ -3153,6 +3153,65 @@ static void *get_raw_rva( char *base, size_t file_size, IMAGE_NT_HEADERS64 *nt,
     return get_raw_file_range( base, file_size, section->PointerToRawData + rva - section->VirtualAddress, size );
 }
 
+static BOOL get_raw_rva_offset( IMAGE_NT_HEADERS64 *nt, IMAGE_SECTION_HEADER *sections,
+                                DWORD rva, size_t size, size_t *offset )
+{
+    IMAGE_SECTION_HEADER *section;
+
+    if (rva < nt->OptionalHeader.SizeOfHeaders)
+    {
+        *offset = rva;
+        return TRUE;
+    }
+    if (!(section = get_raw_section( sections, nt->FileHeader.NumberOfSections, rva, size )))
+        return FALSE;
+    *offset = section->PointerToRawData + rva - section->VirtualAddress;
+    return TRUE;
+}
+
+static void copy_arm64x_read_overlap( char *buffer, size_t read_size, off_t read_offset,
+                                      size_t raw_offset, const void *value, size_t value_size )
+{
+    size_t read_start = read_offset;
+    size_t read_end, value_end, start, end;
+
+    if (read_start > (size_t)-1 - read_size || raw_offset > (size_t)-1 - value_size) return;
+    read_end = read_start + read_size;
+    value_end = raw_offset + value_size;
+    start = max( read_start, raw_offset );
+    end = min( read_end, value_end );
+    if (start >= end) return;
+    memcpy( buffer + start - read_start, (const char *)value + start - raw_offset, end - start );
+}
+
+static BOOL raw_image_export_is_ntdll( char *base, size_t file_size, IMAGE_NT_HEADERS64 *nt,
+                                       IMAGE_SECTION_HEADER *sections )
+{
+    const IMAGE_EXPORT_DIRECTORY *exports;
+    const IMAGE_DATA_DIRECTORY *dir;
+    const char *name;
+    size_t max_size, i;
+    static const char expected[] = "ntdll.dll";
+
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXPORT) return FALSE;
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dir->VirtualAddress || dir->Size < sizeof(*exports) ||
+        !(exports = get_raw_rva( base, file_size, nt, sections, dir->VirtualAddress, sizeof(*exports) )) ||
+        !exports->Name ||
+        !(name = get_raw_rva( base, file_size, nt, sections, exports->Name, 1 )))
+        return FALSE;
+
+    max_size = file_size - (name - base);
+    if (max_size < sizeof(expected)) return FALSE;
+    for (i = 0; i < sizeof(expected); ++i)
+    {
+        char ch = name[i];
+        if (ch >= 'A' && ch <= 'Z') ch += 'a' - 'A';
+        if (ch != expected[i]) return FALSE;
+    }
+    return TRUE;
+}
+
 static char *get_arm64x_read_fixup_target( char *buffer, size_t read_size, off_t read_offset,
                                            IMAGE_NT_HEADERS64 *nt, IMAGE_SECTION_HEADER *sections,
                                            DWORD rva, size_t size )
@@ -3229,8 +3288,80 @@ static void apply_arm64x_read_fixups( char *buffer, size_t read_size, off_t read
     }
 }
 
-static void apply_arm64x_read_fixups_to_file( int fd, void *buffer, size_t read_size, off_t read_offset )
+static void apply_arm64x_live_base_relocations(
+    char *file, size_t file_size, char *buffer, size_t read_size, off_t read_offset,
+    IMAGE_NT_HEADERS64 *nt, IMAGE_SECTION_HEADER *sections,
+    const IMAGE_BASE_RELOCATION *arm64x_reloc, size_t arm64x_reloc_size,
+    const struct apply_arm64x_read_fixups_params *params )
 {
+    const IMAGE_BASE_RELOCATION *reloc, *reloc_end;
+    const IMAGE_DATA_DIRECTORY *dir;
+    ULONGLONG image_base;
+    INT64 delta;
+    size_t image_base_offset;
+
+    if (!(params->flags & ARM64X_READ_FIXUP_LIVE_NTDLL_VIEW) ||
+        !params->live_module_base ||
+        nt->FileHeader.TimeDateStamp != params->live_module_timestamp ||
+        nt->OptionalHeader.SizeOfImage != params->live_module_size ||
+        (nt->FileHeader.Machine != IMAGE_FILE_MACHINE_ARM64 &&
+         nt->FileHeader.Machine != IMAGE_FILE_MACHINE_ARM64X) ||
+        !raw_image_export_is_ntdll( file, file_size, nt, sections ))
+        return;
+
+    image_base = params->live_module_base;
+    image_base_offset = (char *)&nt->OptionalHeader.ImageBase - file;
+    copy_arm64x_read_overlap( buffer, read_size, read_offset, image_base_offset,
+                              &image_base, sizeof(image_base) );
+
+    delta = params->live_module_base - nt->OptionalHeader.ImageBase;
+    if (!delta || nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_BASERELOC)
+        return;
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if (!dir->VirtualAddress || dir->Size < sizeof(*reloc) ||
+        !(reloc = get_raw_rva( file, file_size, nt, sections,
+                               dir->VirtualAddress, dir->Size )))
+        return;
+    reloc_end = (const IMAGE_BASE_RELOCATION *)((const char *)reloc + dir->Size);
+
+    while (reloc < reloc_end - 1 && reloc->SizeOfBlock >= sizeof(*reloc) &&
+           reloc->SizeOfBlock <= (const char *)reloc_end - (const char *)reloc)
+    {
+        const USHORT *entry = (const USHORT *)(reloc + 1);
+        const USHORT *entry_end = (const USHORT *)((const char *)reloc + reloc->SizeOfBlock);
+
+        while (entry < entry_end)
+        {
+            USHORT type = *entry >> 12;
+            USHORT offset = *entry & 0xfff;
+            size_t raw_offset;
+            ULONGLONG value;
+
+            entry++;
+            if (type == IMAGE_REL_BASED_ABSOLUTE) continue;
+            if (type != IMAGE_REL_BASED_DIR64) continue;
+            if (!get_raw_rva_offset( nt, sections, reloc->VirtualAddress + offset,
+                                      sizeof(value), &raw_offset ) ||
+                !(get_raw_file_range( file, file_size, raw_offset, sizeof(value) )))
+                continue;
+
+            memcpy( &value, file + raw_offset, sizeof(value) );
+            if (arm64x_reloc)
+                apply_arm64x_read_fixups( (char *)&value, sizeof(value), raw_offset, nt, sections,
+                                          arm64x_reloc, arm64x_reloc_size );
+            value += delta;
+            copy_arm64x_read_overlap( buffer, read_size, read_offset, raw_offset,
+                                      &value, sizeof(value) );
+        }
+        reloc = (const IMAGE_BASE_RELOCATION *)entry_end;
+    }
+}
+
+static void apply_arm64x_read_fixups_to_file( int fd,
+                                              struct apply_arm64x_read_fixups_params *params )
+{
+    const IMAGE_BASE_RELOCATION *arm64x_reloc = NULL;
+    size_t arm64x_reloc_size = 0;
     IMAGE_DYNAMIC_RELOCATION_TABLE *table;
     IMAGE_LOAD_CONFIG_DIRECTORY64 *cfg;
     IMAGE_DATA_DIRECTORY *dir;
@@ -3239,6 +3370,10 @@ static void apply_arm64x_read_fixups_to_file( int fd, void *buffer, size_t read_
     IMAGE_NT_HEADERS64 *nt;
     struct stat st;
     char *base, *ptr, *end;
+
+    char *buffer = params->buffer;
+    size_t read_size = params->size;
+    off_t read_offset = params->offset;
 
     if (!is_arm64ec() || read_offset < 0 || fstat( fd, &st ) == -1 || st.st_size <= 0)
         return;
@@ -3286,8 +3421,10 @@ static void apply_arm64x_read_fixups_to_file( int fd, void *buffer, size_t read_
             if (end - ptr < sizeof(*dyn) || dyn->BaseRelocSize > end - ptr - sizeof(*dyn)) break;
             if (dyn->Symbol == IMAGE_DYNAMIC_RELOCATION_ARM64X)
             {
+                arm64x_reloc = (IMAGE_BASE_RELOCATION *)(dyn + 1);
+                arm64x_reloc_size = dyn->BaseRelocSize;
                 apply_arm64x_read_fixups( buffer, read_size, read_offset, nt, sections,
-                                          (IMAGE_BASE_RELOCATION *)(dyn + 1), dyn->BaseRelocSize );
+                                          arm64x_reloc, arm64x_reloc_size );
                 break;
             }
             ptr += sizeof(*dyn) + dyn->BaseRelocSize;
@@ -3303,8 +3440,10 @@ static void apply_arm64x_read_fixups_to_file( int fd, void *buffer, size_t read_
                 break;
             if (dyn->Symbol == IMAGE_DYNAMIC_RELOCATION_ARM64X)
             {
+                arm64x_reloc = (IMAGE_BASE_RELOCATION *)(ptr + dyn->HeaderSize);
+                arm64x_reloc_size = dyn->FixupInfoSize;
                 apply_arm64x_read_fixups( buffer, read_size, read_offset, nt, sections,
-                                          (IMAGE_BASE_RELOCATION *)(ptr + dyn->HeaderSize), dyn->FixupInfoSize );
+                                          arm64x_reloc, arm64x_reloc_size );
                 break;
             }
             ptr += dyn->HeaderSize + dyn->FixupInfoSize;
@@ -3312,20 +3451,23 @@ static void apply_arm64x_read_fixups_to_file( int fd, void *buffer, size_t read_
         break;
     }
 
+    apply_arm64x_live_base_relocations( base, st.st_size, buffer, read_size, read_offset,
+                                        nt, sections, arm64x_reloc, arm64x_reloc_size, params );
+
 done:
     munmap( base, st.st_size );
 }
 
-void virtual_apply_arm64x_read_fixups( int fd, void *buffer, size_t size, off_t offset )
+void virtual_apply_arm64x_read_fixups( int fd, struct apply_arm64x_read_fixups_params *params )
 {
-    if (!size) return;
-    if (offset < 0)
+    if (!params->size) return;
+    if (params->offset < 0)
     {
-        if ((offset = lseek( fd, 0, SEEK_CUR )) >= size) offset -= size;
-        else offset = -1;
+        if ((params->offset = lseek( fd, 0, SEEK_CUR )) >= params->size) params->offset -= params->size;
+        else params->offset = -1;
     }
 
-    if (offset >= 0) apply_arm64x_read_fixups_to_file( fd, buffer, size, offset );
+    if (params->offset >= 0) apply_arm64x_read_fixups_to_file( fd, params );
 }
 
 /***********************************************************************
@@ -3385,12 +3527,10 @@ static void update_arm64x_mapping( struct file_view *view, IMAGE_NT_HEADERS *nt,
 #endif  /* __aarch64__ */
 
 #ifndef __aarch64__
-void virtual_apply_arm64x_read_fixups( int fd, void *buffer, size_t size, off_t offset )
+void virtual_apply_arm64x_read_fixups( int fd, struct apply_arm64x_read_fixups_params *params )
 {
     (void)fd;
-    (void)buffer;
-    (void)size;
-    (void)offset;
+    (void)params;
 }
 #endif
 

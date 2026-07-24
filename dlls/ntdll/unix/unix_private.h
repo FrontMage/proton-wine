@@ -317,7 +317,7 @@ extern void virtual_map_user_shared_data(void);
 extern void virtual_init_user_shared_data(void);
 extern NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack );
 extern unsigned int virtual_locked_server_call( void *req_ptr );
-extern void virtual_apply_arm64x_read_fixups( int fd, void *buffer, size_t size, off_t offset );
+extern void virtual_apply_arm64x_read_fixups( int fd, struct apply_arm64x_read_fixups_params *params );
 extern ssize_t virtual_locked_read( int fd, void *addr, size_t size );
 extern ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset );
 extern ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags );
