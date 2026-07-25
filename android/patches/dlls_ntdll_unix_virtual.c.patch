@@ -1,12 +1,9 @@
 diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
-index 6e1697720f0..c12be9ba401 100644
+index e8124240648..c12be9ba401 100644
 --- a/dlls/ntdll/unix/virtual.c
 +++ b/dlls/ntdll/unix/virtual.c
-@@ -100,9 +100,13 @@
+@@ -100,6 +100,10 @@
  #include "unix_private.h"
- #ifdef __aarch64__
- #include "arm64x.h"
- #endif
  #include "wine/debug.h"
 
 +#ifdef __ANDROID__
