@@ -876,6 +876,16 @@ static void test_css_style_declaration(IHTMLCSSStyleDeclaration *css_style)
     test_var_bstr(&v, L"0");
     VariantClear(&v);
 
+    V_VT(&v) = VT_INT;
+    V_INT(&v) = 1;
+    hres = IHTMLCSSStyleDeclaration_put_opacity(css_style, v);
+    ok(hres == S_OK, "put_opacity(VT_INT) failed: %08lx\n", hres);
+
+    hres = IHTMLCSSStyleDeclaration_get_opacity(css_style, &v);
+    ok(hres == S_OK, "get_opacity after VT_INT failed: %08lx\n", hres);
+    test_var_bstr(&v, L"1");
+    VariantClear(&v);
+
     V_VT(&v) = VT_R8;
     V_R8(&v) = 0.5;
     hres = IHTMLCSSStyleDeclaration_put_opacity(css_style, v);
@@ -2514,6 +2524,28 @@ static void test_body_style(IHTMLStyle *style)
     ok(V_VT(&v) == VT_BSTR, "type failed: %d\n", V_VT(&v));
     ok(!lstrcmpW(V_BSTR(&v), L"red"), "str=%s\n", wine_dbgstr_w(V_BSTR(&v)));
     VariantClear(&v);
+
+    if(compat_mode < COMPAT_IE9) {
+        V_VT(&v) = VT_INT;
+        V_INT(&v) = 0x00ffffff;
+        hres = IHTMLStyle_put_backgroundColor(style, v);
+        ok(hres == S_OK, "put_backgroundColor(VT_INT white) failed: %08lx\n", hres);
+
+        hres = IHTMLStyle_get_backgroundColor(style, &v);
+        ok(hres == S_OK, "get_backgroundColor after VT_INT white failed: %08lx\n", hres);
+        test_var_bstr(&v, L"#ffffff");
+        VariantClear(&v);
+
+        V_VT(&v) = VT_INT;
+        V_INT(&v) = 0;
+        hres = IHTMLStyle_put_backgroundColor(style, v);
+        ok(hres == S_OK, "put_backgroundColor(VT_INT black) failed: %08lx\n", hres);
+
+        hres = IHTMLStyle_get_backgroundColor(style, &v);
+        ok(hres == S_OK, "get_backgroundColor after VT_INT black failed: %08lx\n", hres);
+        test_var_bstr(&v, L"#000000");
+        VariantClear(&v);
+    }
 
     str = SysAllocString(L"fixed");
     hres = IHTMLStyle_put_backgroundAttachment(style, str);

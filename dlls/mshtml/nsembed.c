@@ -1026,6 +1026,11 @@ HRESULT variant_to_nsstr(VARIANT *v, BOOL hex_int, nsAString *nsstr)
         nsAString_Init(nsstr, buf);
         break;
 
+    case VT_INT:
+        wsprintfW(buf, hex_int ? L"#%06x" : L"%d", V_INT(v));
+        nsAString_Init(nsstr, buf);
+        break;
+
     case VT_R8:
     case VT_DISPATCH: {
         VARIANT strv;
