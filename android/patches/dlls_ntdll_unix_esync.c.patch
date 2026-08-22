@@ -3,7 +3,7 @@ new file mode 100644
 index 00000000000..202e945b95b
 --- /dev/null
 +++ b/dlls/ntdll/unix/esync.c
-@@ -0,0 +1,1271 @@
+@@ -0,0 +1,1334 @@
 +/*
 + * eventfd-based synchronization objects
 + *
@@ -52,6 +52,7 @@ index 00000000000..202e945b95b
 +#include "wine/debug.h"
 +
 +#include "unix_private.h"
++#include "sync.h"
 +#include "esync.h"
 +#include "fsync.h"
 +#ifdef __ANDROID__
@@ -168,7 +169,9 @@ index 00000000000..202e945b95b
 +    return idx % ESYNC_LIST_BLOCK_SIZE;
 +}
 +
-+static struct esync *add_to_list( HANDLE handle, enum esync_type type, int fd, void *shm )
++/* fd_cache_mutex serializes allocation/publication with NtClose and with
++ * competing receivers for the same Windows handle. */
++static struct esync *get_list_slot( HANDLE handle )
 +{
 +    UINT_PTR entry, idx = handle_to_index( handle, &entry );
 +
@@ -191,11 +194,6 @@ index 00000000000..202e945b95b
 +        }
 +    }
 +
-+    if (!InterlockedCompareExchange( (LONG *)&esync_list[entry][idx].type, type, 0 ))
-+    {
-+        esync_list[entry][idx].fd = fd;
-+        esync_list[entry][idx].shm = shm;
-+    }
 +    return &esync_list[entry][idx];
 +}
 +
@@ -241,18 +239,44 @@ index 00000000000..202e945b95b
 +    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
 +    if (!(*obj = get_cached_object( handle )))
 +    {
-+        SERVER_START_REQ( get_inproc_sync_fd )
++        struct esync *slot = get_list_slot( handle );
++
++        if (!slot)
++            ret = STATUS_NO_MEMORY;
++        else
 +        {
-+            req->handle = wine_server_obj_handle( handle );
-+            if (!(ret = wine_server_call( req )))
++            SERVER_START_REQ( get_inproc_sync_fd )
 +            {
-+                type = reply->type;
-+                shm_idx = reply->sync_shm_idx;
-+                fd = wine_server_receive_fd( &fd_handle );
-+                assert( wine_server_ptr_handle(fd_handle) == handle );
++                req->handle = wine_server_obj_handle( handle );
++                if (!(ret = wine_server_call( req )))
++                {
++                    type = reply->type;
++                    shm_idx = reply->sync_shm_idx;
++                    fd = wine_server_receive_fd( &fd_handle );
++                    assert( wine_server_ptr_handle(fd_handle) == handle );
++
++                    /* The generic in-process cache owns the handle reference
++                     * and keeps the fd alive across concurrent waits. If a
++                     * reused handle still has an older referenced object,
++                     * fail back to server synchronization for this operation
++                     * instead of publishing or leaking the new fd. */
++                    if (!esync_register_inproc_locked( handle, fd ))
++                    {
++                        close( fd );
++                        fd = -1;
++                        ret = STATUS_NOT_IMPLEMENTED;
++                    }
++                    else
++                    {
++                        slot->fd = fd;
++                        slot->shm = shm_idx ? get_shm( shm_idx ) : 0;
++                        InterlockedExchange( (LONG *)&slot->type, type );
++                        *obj = slot;
++                    }
++                }
 +            }
++            SERVER_END_REQ;
 +        }
-+        SERVER_END_REQ;
 +    }
 +    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
 +
@@ -270,9 +294,7 @@ index 00000000000..202e945b95b
 +    }
 +
 +    TRACE("Got fd %d for handle %p.\n", fd, handle);
-+
-+    *obj = add_to_list( handle, type, fd, shm_idx ? get_shm( shm_idx ) : 0 );
-+    return ret;
++    return STATUS_SUCCESS;
 +}
 +
 +NTSTATUS esync_close( HANDLE handle )
@@ -283,11 +305,11 @@ index 00000000000..202e945b95b
 +
 +    if (entry < ESYNC_LIST_ENTRIES && esync_list[entry])
 +    {
++        /* fd_cache_mutex is held by close_inproc_sync(). Evict the fast
++         * lookup entry first; the generic cache releases the handle-owned
++         * reference and closes the fd after outstanding waits finish. */
 +        if (InterlockedExchange((LONG *)&esync_list[entry][idx].type, 0))
-+        {
-+            close( esync_list[entry][idx].fd );
 +            return STATUS_SUCCESS;
-+        }
 +    }
 +
 +    return STATUS_INVALID_HANDLE;
@@ -781,6 +803,7 @@ index 00000000000..202e945b95b
 +{
 +    static const LARGE_INTEGER zero;
 +
++    struct inproc_sync *inproc_refs[MAXIMUM_WAIT_OBJECTS];
 +    struct esync *objs[MAXIMUM_WAIT_OBJECTS];
 +    struct pollfd fds[MAXIMUM_WAIT_OBJECTS + 1];
 +    int has_esync = 0, has_server = 0;
@@ -791,6 +814,9 @@ index 00000000000..202e945b95b
 +    int64_t value;
 +    ssize_t size;
 +    int i, j, ret;
++
++    memset( inproc_refs, 0, sizeof(inproc_refs) );
++    memset( objs, 0, sizeof(objs) );
 +
 +    /* Grab the APC fd if we don't already have it. */
 +    if (alertable && ntdll_get_thread_data()->alert_fd == -1)
@@ -833,13 +859,30 @@ index 00000000000..202e945b95b
 +        else if (ret == STATUS_NOT_IMPLEMENTED)
 +            has_server = 1;
 +        else
-+            return ret;
++            goto cleanup;
++    }
++
++    for (i = 0; i < count; i++)
++    {
++        if (!objs[i]) continue;
++
++        /* Keep the eventfd valid if another thread closes or reuses the
++         * Windows handle while this wait is blocked. */
++        inproc_refs[i] = get_cached_inproc_sync( handles[i] );
++        if (!inproc_refs[i])
++        {
++            ret = STATUS_INVALID_HANDLE;
++            goto cleanup;
++        }
 +    }
 +
 +    if (has_esync && has_server)
 +        FIXME("Can't wait on esync and server objects at the same time!\n");
 +    else if (has_server)
-+        return STATUS_NOT_IMPLEMENTED;
++    {
++        ret = STATUS_NOT_IMPLEMENTED;
++        goto cleanup;
++    }
 +
 +    if (TRACE_ON(esync))
 +    {
@@ -879,7 +922,8 @@ index 00000000000..202e945b95b
 +                    {
 +                        TRACE("Woken up by handle %p [%d].\n", handles[i], i);
 +                        mutex->count++;
-+                        return i;
++                        ret = i;
++                        goto cleanup;
 +                    }
 +                    else if (!mutex->count)
 +                    {
@@ -894,7 +938,8 @@ index 00000000000..202e945b95b
 +                                TRACE("Woken up by handle %p [%d].\n", handles[i], i);
 +                            mutex->tid = GetCurrentThreadId();
 +                            mutex->count++;
-+                            return i;
++                            ret = i;
++                            goto cleanup;
 +                        }
 +                    }
 +                    break;
@@ -909,7 +954,8 @@ index 00000000000..202e945b95b
 +                        {
 +                            TRACE("Woken up by handle %p [%d].\n", handles[i], i);
 +                            InterlockedDecrement( (LONG *)&semaphore->count );
-+                            return i;
++                            ret = i;
++                            goto cleanup;
 +                        }
 +                    }
 +                    break;
@@ -927,7 +973,8 @@ index 00000000000..202e945b95b
 +                        {
 +                            TRACE("Woken up by handle %p [%d].\n", handles[i], i);
 +                            event->signaled = 0;
-+                            return i;
++                            ret = i;
++                            goto cleanup;
 +                        }
 +                    }
 +                    break;
@@ -946,7 +993,8 @@ index 00000000000..202e945b95b
 +                                break;
 +                        }
 +                        TRACE("Woken up by handle %p [%d].\n", handles[i], i);
-+                        return i;
++                        ret = i;
++                        goto cleanup;
 +                    }
 +                    break;
 +                }
@@ -966,7 +1014,8 @@ index 00000000000..202e945b95b
 +        {
 +            if (has_esync)
 +                FIXME("Can't wait on esync and server objects at the same time! Falling back to server.\n");
-+            return STATUS_NOT_IMPLEMENTED;
++            ret = STATUS_NOT_IMPLEMENTED;
++            goto cleanup;
 +        }
 +
 +        if (alertable)
@@ -1001,7 +1050,8 @@ index 00000000000..202e945b95b
 +                    if (fds[i].revents & (POLLERR | POLLHUP | POLLNVAL))
 +                    {
 +                        ERR("Wait-any polling on fd %d returned %#x.\n", fds[i].fd, fds[i].revents);
-+                        return STATUS_INVALID_HANDLE;
++                        ret = STATUS_INVALID_HANDLE;
++                        goto cleanup;
 +                    }
 +
 +                    if (obj)
@@ -1014,7 +1064,8 @@ index 00000000000..202e945b95b
 +                            if (fds[i].revents & POLLIN)
 +                            {
 +                                TRACE("Woken up by handle %p [%d].\n", handles[i], i);
-+                                return i;
++                                ret = i;
++                                goto cleanup;
 +                            }
 +                        }
 +                        else
@@ -1024,8 +1075,10 @@ index 00000000000..202e945b95b
 +                                /* We found our object. */
 +                                TRACE("Woken up by handle %p [%d].\n", handles[i], i);
 +                                if (update_grabbed_object( obj ))
-+                                    return STATUS_ABANDONED_WAIT_0 + i;
-+                                return i;
++                                    ret = STATUS_ABANDONED_WAIT_0 + i;
++                                else
++                                    ret = i;
++                                goto cleanup;
 +                            }
 +                        }
 +                    }
@@ -1099,7 +1152,8 @@ index 00000000000..202e945b95b
 +                if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL))
 +                {
 +                    ERR("Wait-all polling on fd %d returned %#x.\n", fds[0].fd, fds[0].revents);
-+                    return STATUS_INVALID_HANDLE;
++                    ret = STATUS_INVALID_HANDLE;
++                    goto cleanup;
 +                }
 +            }
 +
@@ -1154,7 +1208,8 @@ index 00000000000..202e945b95b
 +                                if (write( fds[j].fd, &value, sizeof(value) ) == -1)
 +                                {
 +                                    ERR("write failed.\n");
-+                                    return errno_to_status( errno );
++                                    ret = errno_to_status( errno );
++                                    goto cleanup;
 +                                }
 +                            }
 +
@@ -1177,10 +1232,12 @@ index 00000000000..202e945b95b
 +                if (abandoned)
 +                {
 +                    TRACE("Wait successful, but some object(s) were abandoned.\n");
-+                    return STATUS_ABANDONED;
++                    ret = STATUS_ABANDONED;
++                    goto cleanup;
 +                }
 +                TRACE("Wait successful.\n");
-+                return STATUS_SUCCESS;
++                ret = STATUS_SUCCESS;
++                goto cleanup;
 +            }
 +
 +            /* If we got here, ppoll() returned less than all of our objects.
@@ -1194,12 +1251,14 @@ index 00000000000..202e945b95b
 +    if (ret == 0)
 +    {
 +        TRACE("Wait timed out.\n");
-+        return STATUS_TIMEOUT;
++        ret = STATUS_TIMEOUT;
++        goto cleanup;
 +    }
 +    else
 +    {
 +        ERR("ppoll failed: %s\n", strerror(errno));
-+        return errno_to_status( errno );
++        ret = errno_to_status( errno );
++        goto cleanup;
 +    }
 +
 +userapc:
@@ -1213,6 +1272,10 @@ index 00000000000..202e945b95b
 +     * before we got SIGUSR1. poll() doesn't return EINTR in that case. The
 +     * right thing to do seems to be to return STATUS_USER_APC anyway. */
 +    if (ret == STATUS_TIMEOUT) ret = STATUS_USER_APC;
++
++cleanup:
++    for (i = 0; i < count; i++)
++        if (inproc_refs[i]) release_inproc_sync( inproc_refs[i] );
 +    return ret;
 +}
 +

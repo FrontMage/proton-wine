@@ -65,6 +65,7 @@ static void     (WINAPI *pThreadTerm)(HANDLE,LONG);
 static void     (WINAPI *pUpdateProcessorInformation)(SYSTEM_CPU_INFORMATION*);
 
 static BOOLEAN emulated_processor_features[PROCESSOR_FEATURE_MAX];
+static BOOL full_eflags_sideband_enabled;
 static BYTE KiUserExceptionDispatcher_orig[16]; /* to detect patching */
 static HMODULE live_ntdll_base;
 static ULONG live_ntdll_size;
@@ -74,6 +75,56 @@ extern void KiUserExceptionDispatcher_thunk(void) asm("EXP+#KiUserExceptionDispa
 static inline CHPE_V2_CPU_AREA_INFO *get_arm64ec_cpu_area(void)
 {
     return NtCurrentTeb()->ChpeV2CpuAreaInfo;
+}
+
+#define FEX_EFLAGS_SIDEBAND_MAGIC                     0x4645ull
+#define FEX_EFLAGS_SIDEBAND_VERSION                   1ull
+#define FEX_EFLAGS_SIDEBAND_OFFER                     0x01
+#define FEX_EFLAGS_SIDEBAND_ACK                       0x02
+#define FEX_EFLAGS_SIDEBAND_FEX_TO_WINE_EXCEPTION     0x10
+#define FEX_EFLAGS_SIDEBAND_WINE_TO_FEX_CONTINUE      0x20
+#define FEX_EFLAGS_SIDEBAND_MAKE(kind, eflags) \
+    ((FEX_EFLAGS_SIDEBAND_MAGIC << 48) | (FEX_EFLAGS_SIDEBAND_VERSION << 40) | \
+     ((ULONGLONG)(kind) << 32) | (UINT)(eflags))
+
+_Static_assert( FEX_EFLAGS_SIDEBAND_MAKE( FEX_EFLAGS_SIDEBAND_OFFER, 0 ) ==
+                0x4645010100000000ull, "full EFLAGS offer encoding" );
+_Static_assert( FEX_EFLAGS_SIDEBAND_MAKE( FEX_EFLAGS_SIDEBAND_ACK, 0 ) ==
+                0x4645010200000000ull, "full EFLAGS ack encoding" );
+_Static_assert( FEX_EFLAGS_SIDEBAND_MAKE( FEX_EFLAGS_SIDEBAND_FEX_TO_WINE_EXCEPTION, 0x10297 ) ==
+                0x4645011000010297ull, "full EFLAGS exception encoding" );
+_Static_assert( FEX_EFLAGS_SIDEBAND_MAKE( FEX_EFLAGS_SIDEBAND_WINE_TO_FEX_CONTINUE, 0x2f7fd7 ) ==
+                0x46450120002f7fd7ull, "full EFLAGS continuation encoding" );
+
+static inline BOOL full_eflags_sideband_is( ULONGLONG value, BYTE kind )
+{
+    return (value >> 48) == FEX_EFLAGS_SIDEBAND_MAGIC &&
+           (BYTE)(value >> 40) == FEX_EFLAGS_SIDEBAND_VERSION &&
+           (BYTE)(value >> 32) == kind;
+}
+
+static ULONGLONG full_eflags_sideband_exchange( ULONGLONG value )
+{
+    volatile LONGLONG *slot = (volatile LONGLONG *)&get_arm64ec_cpu_area()->EmulatorDataInline;
+    LONGLONG previous = InterlockedCompareExchange64( slot, 0, 0 );
+    LONGLONG observed;
+
+    while ((observed = InterlockedCompareExchange64( slot, value, previous )) != previous)
+        previous = observed;
+    return previous;
+}
+
+static void stage_full_eflags_continue( const ARM64EC_NT_CONTEXT *context )
+{
+    if (!full_eflags_sideband_enabled) return;
+
+    if ((context->ContextFlags & CONTEXT_AMD64_CONTROL) == CONTEXT_AMD64_CONTROL &&
+        !RtlIsEcCode( context->Pc ))
+        full_eflags_sideband_exchange(
+            FEX_EFLAGS_SIDEBAND_MAKE( FEX_EFLAGS_SIDEBAND_WINE_TO_FEX_CONTINUE,
+                                      context->AMD64_EFlags ));
+    else
+        full_eflags_sideband_exchange( 0 );
 }
 
 static inline BOOL is_valid_arm64ec_frame( ULONG_PTR frame )
@@ -93,8 +144,16 @@ static inline BOOL enter_syscall_callback(void)
 
 static inline void leave_syscall_callback(void)
 {
-    get_arm64ec_cpu_area()->InSyscallCallback = 0;
-    if (get_arm64ec_cpu_area()->SuspendDoorbell && *get_arm64ec_cpu_area()->SuspendDoorbell) arm64ec_suspend_point();
+    CHPE_V2_CPU_AREA_INFO *cpu_area = get_arm64ec_cpu_area();
+    CONTEXT ctx;
+
+    cpu_area->InSyscallCallback = 0;
+
+    if (cpu_area->SuspendDoorbell && *cpu_area->SuspendDoorbell)
+    {
+        RtlCaptureContext( &ctx );
+        if (*cpu_area->SuspendDoorbell) NtContinue( &ctx, FALSE );
+    }
 }
 
 /**********************************************************************
@@ -239,7 +298,20 @@ NTSTATUS arm64ec_process_init( HMODULE module )
     memcpy( KiUserExceptionDispatcher_orig, KiUserExceptionDispatcher_thunk, sizeof(KiUserExceptionDispatcher_orig) );
 
     enter_syscall_callback();
-    if (pProcessInit) status = pProcessInit();
+    full_eflags_sideband_enabled = FALSE;
+    if (pProcessInit)
+    {
+        full_eflags_sideband_exchange(
+            FEX_EFLAGS_SIDEBAND_MAKE( FEX_EFLAGS_SIDEBAND_OFFER, 0 ));
+        status = pProcessInit();
+        if (!status)
+        {
+            ULONGLONG response = full_eflags_sideband_exchange( 0 );
+            full_eflags_sideband_enabled =
+                full_eflags_sideband_is( response, FEX_EFLAGS_SIDEBAND_ACK );
+        }
+        else full_eflags_sideband_exchange( 0 );
+    }
     if (!status)
     {
         for (unsigned int i = 0; i < PROCESSOR_FEATURE_MAX; i++)
@@ -677,17 +749,25 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
 NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
+    stage_full_eflags_continue( (ARM64EC_NT_CONTEXT *)context );
     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
-    return syscall_NtContinue( &arm_ctx, alertable );
+    status = syscall_NtContinue( &arm_ctx, alertable );
+    if (full_eflags_sideband_enabled) full_eflags_sideband_exchange( 0 );
+    return status;
 }
 
 NTSTATUS SYSCALL_API NtContinueEx( CONTEXT *context, KCONTINUE_ARGUMENT *args )
 {
     ARM64_NT_CONTEXT arm_ctx;
+    NTSTATUS status;
 
+    stage_full_eflags_continue( (ARM64EC_NT_CONTEXT *)context );
     context_x64_to_arm( &arm_ctx, (ARM64EC_NT_CONTEXT *)context );
-    return syscall_NtContinueEx( &arm_ctx, args );
+    status = syscall_NtContinueEx( &arm_ctx, args );
+    if (full_eflags_sideband_enabled) full_eflags_sideband_exchange( 0 );
+    return status;
 }
 
 NTSTATUS SYSCALL_API NtFlushInstructionCache( HANDLE process, const void *addr, SIZE_T size )
@@ -848,21 +928,18 @@ NTSTATUS SYSCALL_API NtReadFile( HANDLE handle, HANDLE event, PIO_APC_ROUTINE ap
     if (pBTCpu64NotifyReadFile && enter_syscall_callback())
     {
         pBTCpu64NotifyReadFile( handle, buffer, length, FALSE, 0 );
-        status = syscall_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
-        if (!status && io->Information)
-        {
-            params.size = io->Information;
-            WINE_UNIX_CALL( unix_apply_arm64x_read_fixups, &params );
-        }
-        if (pBTCpu64NotifyReadFile) pBTCpu64NotifyReadFile( handle, buffer, length, TRUE, status );
         leave_syscall_callback();
-        return status;
     }
     status = syscall_NtReadFile( handle, event, apc, apc_user, io, buffer, length, offset, key );
     if (!status && io->Information)
     {
         params.size = io->Information;
         WINE_UNIX_CALL( unix_apply_arm64x_read_fixups, &params );
+    }
+    if (pBTCpu64NotifyReadFile && enter_syscall_callback())
+    {
+        pBTCpu64NotifyReadFile( handle, buffer, length, TRUE, status );
+        leave_syscall_callback();
     }
     return status;
 }
@@ -1350,6 +1427,12 @@ static void * __attribute__((used)) prepare_exception_arm64ec( EXCEPTION_RECORD 
     if (rec->ExceptionCode == STATUS_EMULATION_SYSCALL) dispatch_syscall( arm_ctx );
     RtlInitializeExtendedContext( context, ctx_flags_arm_to_x64( arm_ctx->ContextFlags ), &xctx );
     context_arm_to_x64( &context->context, arm_ctx );
+    if (full_eflags_sideband_enabled)
+    {
+        ULONGLONG sideband = full_eflags_sideband_exchange( 0 );
+        if (full_eflags_sideband_is( sideband, FEX_EFLAGS_SIDEBAND_FEX_TO_WINE_EXCEPTION ))
+            context->context.AMD64_EFlags = (UINT)sideband;
+    }
     if (pResetToConsistentState) pResetToConsistentState( rec, &context->context.AMD64_Context, arm_ctx );
     /* call x64 dispatcher if the thunk or the function pointer was modified */
     if (pWow64PrepareForException || memcmp( KiUserExceptionDispatcher_thunk, KiUserExceptionDispatcher_orig,
@@ -1478,7 +1561,8 @@ static void __attribute__((used)) capture_context( CONTEXT *context, UINT cpsr, 
     /* unwind one level to get register values from caller function */
     unwind_context = *context;
     unwind_one_frame( &unwind_context );
-    memcpy( &context->Rax, &unwind_context.Rax, offsetof(CONTEXT,FltSave) - offsetof(CONTEXT,Rax) );
+    if (!RtlIsEcCode( unwind_context.Rip ))
+        memcpy( &context->Rax, &unwind_context.Rax, offsetof(CONTEXT,FltSave) - offsetof(CONTEXT,Rax) );
 }
 
 /***********************************************************************

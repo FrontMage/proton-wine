@@ -271,6 +271,16 @@ typedef struct _STORAGE_DESCRIPTOR_HEADER {
     ULONG                       Size;
 } STORAGE_DESCRIPTOR_HEADER, *PSTORAGE_DESCRIPTOR_HEADER;
 
+typedef struct _STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR {
+    ULONG                       Version;
+    ULONG                       Size;
+    ULONG                       BytesPerCacheLine;
+    ULONG                       BytesOffsetForCacheAlignment;
+    ULONG                       BytesPerLogicalSector;
+    ULONG                       BytesPerPhysicalSector;
+    ULONG                       BytesOffsetForSectorAlignment;
+} STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, *PSTORAGE_ACCESS_ALIGNMENT_DESCRIPTOR;
+
 typedef enum _STORAGE_BUS_TYPE {
     BusTypeUnknown = 0x00,
     BusTypeScsi,

@@ -347,18 +347,21 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
 NTSTATUS signal_set_full_context( CONTEXT *context )
 {
     struct syscall_frame *frame = get_syscall_frame();
-    NTSTATUS status = NtSetContextThread( GetCurrentThread(), context );
+    CHPE_V2_CPU_AREA_INFO *cpu_area = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    NTSTATUS status;
 
-    if (is_arm64ec_suspend_doorbell_valid() && arm64_thread_data()->suspend_pending)
+    if (arm64_thread_data()->suspend_pending && is_arm64ec_suspend_doorbell_valid() &&
+        !cpu_area->InSyscallCallback && !cpu_area->InSimulation)
     {
-        CONTEXT suspend_context;
-        *NtCurrentTeb()->ChpeV2CpuAreaInfo->SuspendDoorbell = 0;
+        sigset_t old_set;
+        pthread_sigmask( SIG_BLOCK, &server_block_set, &old_set );
+        *cpu_area->SuspendDoorbell = 0;
         arm64_thread_data()->suspend_pending = FALSE;
-        suspend_context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REPORTING; /* TODO: check */
-        NtGetContextThread( GetCurrentThread(), &suspend_context );
-        wait_suspend( &suspend_context );
-        NtSetContextThread( GetCurrentThread(), &suspend_context );
+        wait_suspend( context );
+        status = NtSetContextThread( GetCurrentThread(), context );
+        pthread_sigmask( SIG_SETMASK, &old_set, NULL );
     }
+    else status = NtSetContextThread( GetCurrentThread(), context );
 
     if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER) /* TODO: also check with susp */
         frame->restore_flags |= CONTEXT_INTEGER;
@@ -453,18 +456,18 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
     DWORD needed_flags = context->ContextFlags & ~CONTEXT_ARM64;
     THREAD_BASIC_INFORMATION info;
     NTSTATUS ret;
-    BOOL self;
-
-    NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL );
-    self = HandleToULong( info.ClientId.UniqueThread ) == GetCurrentThreadId();
+    BOOL self = (handle == GetCurrentThread());
 
     if (!self)
     {
-        /* Avoid exposing JIT code pointers to other processes on ARM64EC */
-        if (is_arm64ec()) NtSuspendThread( handle, NULL );
+        NtQueryInformationThread( handle, ThreadBasicInformation, &info, sizeof(info), NULL );
+        self = HandleToULong( info.ClientId.UniqueThread ) == GetCurrentThreadId();
+    }
+
+    if (!self)
+    {
         ret = get_thread_context( handle, context, &self, IMAGE_FILE_MACHINE_ARM64 );
-        if (is_arm64ec()) NtResumeThread( handle, NULL );
-        return ret;
+        if (ret || !self) return ret;
     }
 
     if (needed_flags & CONTEXT_INTEGER)
@@ -1345,17 +1348,21 @@ static void quit_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 static void usr1_handler( int signal, siginfo_t *siginfo, void *sigcontext )
 {
     ucontext_t *ucontext = sigcontext;
+    CHPE_V2_CPU_AREA_INFO *cpu_area = NtCurrentTeb()->ChpeV2CpuAreaInfo;
     CONTEXT context;
 
-    if (is_arm64ec_suspend_doorbell_valid() &&
-        (NtCurrentTeb()->ChpeV2CpuAreaInfo->InSimulation || NtCurrentTeb()->ChpeV2CpuAreaInfo->InSyscallCallback))
+    if (cpu_area && cpu_area->SuspendDoorbell &&
+        (cpu_area->InSimulation || cpu_area->InSyscallCallback))
     {
-        *NtCurrentTeb()->ChpeV2CpuAreaInfo->SuspendDoorbell = 1;
-        arm64_thread_data()->suspend_pending = TRUE;
-        return;
+        NTSTATUS status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_COOPERATIVE_SUSPEND,
+                                         0, NULL, NULL );
+        if (status == STATUS_THREAD_WAS_SUSPENDED)
+        {
+            *cpu_area->SuspendDoorbell = -1;
+            arm64_thread_data()->suspend_pending = TRUE;
+        }
     }
-
-    if (is_inside_syscall( SP_sig(ucontext) ))
+    else if (is_inside_syscall( SP_sig(ucontext) ))
     {
         context.ContextFlags = CONTEXT_FULL | CONTEXT_EXCEPTION_REQUEST;
         NtGetContextThread( GetCurrentThread(), &context );

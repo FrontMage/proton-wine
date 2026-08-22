@@ -26,6 +26,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "winternl.h"
+#include "rtlsupportapi.h"
 #include "winioctl.h"
 #include "winuser.h"
 #include "ddk/wdm.h"
@@ -3185,6 +3186,75 @@ static void test_exception_dispatcher(void)
 
 #endif  /* _WIN64 */
 
+#ifdef __arm64ec__
+
+struct nested_continue_params
+{
+    HANDLE event;
+    ULONG64 suspend_rip;
+    LONG pass;
+};
+
+static DWORD WINAPI nested_continue_thread( void *arg )
+{
+    CHPE_V2_CPU_AREA_INFO *chpe = NtCurrentTeb()->ChpeV2CpuAreaInfo;
+    struct nested_continue_params *params = arg;
+    CONTEXT ctx, nested_ctx;
+
+    RtlCaptureContext( &ctx );
+    if (InterlockedIncrement( &params->pass ) != 1) return 0;
+
+    params->suspend_rip = ctx.Rip;
+    chpe->InSyscallCallback = 1;
+    NtSetEvent( params->event, NULL );
+    while (!*chpe->SuspendDoorbell) YieldProcessor();
+
+    /* with InSyscallCallback set, NtContinue does not suspend */
+    RtlCaptureContext( &nested_ctx );
+    if (InterlockedIncrement( &params->pass ) == 2) NtContinue( &nested_ctx, FALSE );
+    chpe->InSyscallCallback = 0;
+
+    /* with InSimulation set, NtContinue does not suspend */
+    chpe->InSimulation = 1;
+    RtlCaptureContext( &nested_ctx );
+    if (InterlockedIncrement( &params->pass ) == 4) NtContinue( &nested_ctx, FALSE );
+    chpe->InSimulation = 0;
+
+    NtContinue( &ctx, FALSE );
+    return 0;
+}
+
+static void test_nested_continue(void)
+{
+    struct nested_continue_params params;
+    HANDLE thread;
+    CONTEXT ctx;
+    DWORD ret;
+
+    params.event = CreateEventW( NULL, FALSE, FALSE, NULL );
+    ok( params.event != NULL, "CreateEvent failed: %lu\n", GetLastError() );
+    params.pass = 0;
+    thread = CreateThread( NULL, 0, nested_continue_thread, &params, 0, NULL );
+    ok( thread != NULL, "CreateThread failed: %lu\n", GetLastError() );
+
+    ret = WaitForSingleObject( params.event, 10000 );
+    ok( ret == WAIT_OBJECT_0, "wait failed %lx\n", ret );
+
+    ctx.ContextFlags = CONTEXT_FULL;
+    ret = GetThreadContext( thread, &ctx );
+    ok( ret, "GetThreadContext failed: %lu\n", GetLastError() );
+    ok( ctx.Rip == params.suspend_rip, "Rip = %llx, expected %llx\n", ctx.Rip, params.suspend_rip );
+
+    ret = WaitForSingleObject( thread, 10000 );
+    ok( ret == WAIT_OBJECT_0, "wait failed %lx\n", ret );
+    ok( params.pass == 6, "pass = %ld\n", params.pass );
+
+    CloseHandle( params.event );
+    CloseHandle( thread );
+}
+
+#endif /* __arm64ec__ */
+
 static void test_arm64ec(void)
 {
 #ifdef __aarch64__
@@ -3225,6 +3295,9 @@ START_TEST(wow64)
     test_init_block();
     test_iosb();
     test_syscalls();
+#endif
+#ifdef __arm64ec__
+    test_nested_continue();
 #endif
     test_memory_notifications();
     test_cpu_area();

@@ -1,0 +1,36 @@
+diff --git a/dlls/ntdll/unix/sync.h b/dlls/ntdll/unix/sync.h
+new file mode 100644
+index 00000000000..6d8210bd5f4
+--- /dev/null
++++ b/dlls/ntdll/unix/sync.h
+@@ -0,0 +1,30 @@
++/*
++ * Internal interface between esync and the in-process fd lifetime cache.
++ * This is not part of the public esync/fsync API.
++ */
++
++#ifndef __INPROC_SYNC_H
++#define __INPROC_SYNC_H
++
++#include <windef.h>
++
++struct inproc_sync;
++
++/* Grab a reference to the cached object for this handle. The caller must
++ * release a non-NULL result with release_inproc_sync(). */
++struct inproc_sync *get_cached_inproc_sync( HANDLE handle );
++
++/* Release a reference and close the underlying fd when the final reference
++ * disappears. */
++void release_inproc_sync( struct inproc_sync *sync );
++
++/* Register the esync fd as the handle-owned reference. The caller must hold
++ * fd_cache_mutex, matching cache_inproc_sync()'s locking contract.
++ *
++ * Returns TRUE when the cache accepted ownership. FALSE means the handle
++ * slot is still occupied by an older referenced object; the caller must keep
++ * ownership of the fd and must not publish it in the esync cache.
++ */
++BOOL esync_register_inproc_locked( HANDLE handle, int fd );
++
++#endif /* __INPROC_SYNC_H */

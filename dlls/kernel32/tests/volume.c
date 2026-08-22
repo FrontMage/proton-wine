@@ -735,6 +735,187 @@ static void test_disk_query_property(void)
     CloseHandle(handle);
 }
 
+static BOOL check_fixed_storage_property(HANDLE handle, const char *name, STORAGE_PROPERTY_ID property,
+                                         void *descriptor, DWORD descriptor_size)
+{
+    STORAGE_PROPERTY_QUERY query = {0};
+    STORAGE_DESCRIPTOR_HEADER header;
+    BYTE small[sizeof(STORAGE_DESCRIPTOR_HEADER) - 1];
+    DWORD error, size;
+    BOOL ret;
+
+    query.PropertyId = property;
+    query.QueryType = PropertyExistsQuery;
+
+    size = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                          NULL, 0, &size, NULL);
+    error = GetLastError();
+    if (!ret && (error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED))
+    {
+        win_skip("%s does not report property %u existence, error %#lx\n", name, property, error);
+        return FALSE;
+    }
+    ok(ret, "%s property %u existence query failed, error %#lx\n", name, property, error);
+    ok(size == 0, "%s property %u existence query returned size %lu\n", name, property, size);
+
+    query.QueryType = PropertyStandardQuery;
+    memset(&header, 0xcc, sizeof(header));
+    size = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                          &header, sizeof(header), &size, NULL);
+    error = GetLastError();
+    if (!ret && (error == ERROR_INVALID_FUNCTION || error == ERROR_NOT_SUPPORTED))
+    {
+        win_skip("%s does not support property %u, error %#lx\n", name, property, error);
+        return FALSE;
+    }
+    ok(ret, "%s property %u header query failed, error %#lx\n", name, property, error);
+    if (!ret) return FALSE;
+    ok(size == sizeof(header), "%s property %u returned size %lu\n", name, property, size);
+    ok(header.Version == descriptor_size, "%s property %u returned version %lu\n",
+       name, property, header.Version);
+    ok(header.Size >= descriptor_size, "%s property %u returned descriptor size %lu\n",
+       name, property, header.Size);
+
+    memset(descriptor, 0xcc, descriptor_size);
+    size = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                          descriptor, descriptor_size, &size, NULL);
+    error = GetLastError();
+    ok(ret, "%s property %u query failed, error %#lx\n", name, property, error);
+    if (!ret) return FALSE;
+    ok(size == descriptor_size, "%s property %u returned size %lu\n", name, property, size);
+    ok(((STORAGE_DESCRIPTOR_HEADER *)descriptor)->Version == descriptor_size,
+       "%s property %u returned version %lu\n", name, property,
+       ((STORAGE_DESCRIPTOR_HEADER *)descriptor)->Version);
+    ok(((STORAGE_DESCRIPTOR_HEADER *)descriptor)->Size >= descriptor_size,
+       "%s property %u returned descriptor size %lu\n", name, property,
+       ((STORAGE_DESCRIPTOR_HEADER *)descriptor)->Size);
+
+    size = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                          small, sizeof(small), &size, NULL);
+    error = GetLastError();
+    ok(!ret, "%s short property %u query unexpectedly succeeded\n", name, property);
+    ok(error == ERROR_INVALID_PARAMETER || error == ERROR_INSUFFICIENT_BUFFER,
+       "%s short property %u query returned error %#lx\n", name, property, error);
+    return TRUE;
+}
+
+static void check_storage_properties(HANDLE handle, const char *name)
+{
+    STORAGE_ADAPTER_DESCRIPTOR adapter;
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR alignment;
+
+    if (check_fixed_storage_property(handle, name, StorageAdapterProperty,
+                                     &adapter, sizeof(adapter)))
+    {
+        ok(adapter.MaximumTransferLength != 0, "%s returned no maximum transfer length\n", name);
+        ok(adapter.MaximumPhysicalPages != 0, "%s returned no maximum physical pages\n", name);
+        ok(adapter.BusType <= BusTypeMaxReserved, "%s returned bus type %#x\n",
+           name, adapter.BusType);
+    }
+
+    if (check_fixed_storage_property(handle, name, StorageAccessAlignmentProperty,
+                                     &alignment, sizeof(alignment)))
+    {
+        ok(alignment.BytesPerLogicalSector >= 512,
+           "%s returned logical sector size %lu\n", name, alignment.BytesPerLogicalSector);
+        ok(alignment.BytesPerLogicalSector &&
+           !(alignment.BytesPerLogicalSector & (alignment.BytesPerLogicalSector - 1)),
+           "%s returned non-power-of-two logical sector size %lu\n",
+           name, alignment.BytesPerLogicalSector);
+        ok(alignment.BytesPerPhysicalSector >= alignment.BytesPerLogicalSector,
+           "%s returned physical/logical sector sizes %lu/%lu\n", name,
+           alignment.BytesPerPhysicalSector, alignment.BytesPerLogicalSector);
+        ok(alignment.BytesPerPhysicalSector &&
+           !(alignment.BytesPerPhysicalSector & (alignment.BytesPerPhysicalSector - 1)),
+           "%s returned non-power-of-two physical sector size %lu\n",
+           name, alignment.BytesPerPhysicalSector);
+        ok(alignment.BytesOffsetForSectorAlignment < alignment.BytesPerPhysicalSector,
+           "%s returned sector alignment offset %lu for physical sector size %lu\n",
+           name, alignment.BytesOffsetForSectorAlignment, alignment.BytesPerPhysicalSector);
+    }
+}
+
+static void test_fixed_storage_properties(void)
+{
+    STORAGE_PROPERTY_QUERY query = {StorageAccessAlignmentProperty, PropertyStandardQuery};
+    STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR alignment;
+    char volume[MAX_PATH];
+    DWORD error, size;
+    HANDLE handle;
+    BOOL ret;
+
+    handle = CreateFileA("\\\\.\\PhysicalDrive0", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         NULL, OPEN_EXISTING, 0, NULL);
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        check_storage_properties(handle, "\\\\.\\PhysicalDrive0");
+        CloseHandle(handle);
+    }
+    else win_skip("can't open \\\\.\\PhysicalDrive0, error %#lx\n", GetLastError());
+
+    handle = CreateFileA("\\\\.\\c:", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         NULL, OPEN_EXISTING, 0, NULL);
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        check_storage_properties(handle, "\\\\.\\c:");
+        CloseHandle(handle);
+    }
+    else win_skip("can't open \\\\.\\c:, error %#lx\n", GetLastError());
+
+    if (GetVolumeNameForVolumeMountPointA("C:\\", volume, ARRAY_SIZE(volume)))
+    {
+        handle = CreateFileA(volume, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            check_storage_properties(handle, volume);
+            CloseHandle(handle);
+        }
+        else win_skip("can't open %s, error %#lx\n", volume, GetLastError());
+    }
+    else win_skip("can't resolve C: volume, error %#lx\n", GetLastError());
+
+    if (GetDriveTypeA("D:\\") == DRIVE_FIXED)
+    {
+        handle = CreateFileA("\\\\.\\d:", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             NULL, OPEN_EXISTING, 0, NULL);
+        if (handle != INVALID_HANDLE_VALUE)
+        {
+            check_storage_properties(handle, "\\\\.\\d:");
+            CloseHandle(handle);
+        }
+        else win_skip("can't open \\\\.\\d:, error %#lx\n", GetLastError());
+    }
+
+    handle = CreateFileA("C:\\windows", 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (handle != INVALID_HANDLE_VALUE)
+    {
+        size = 0xdeadbeef;
+        SetLastError(0xdeadbeef);
+        ret = DeviceIoControl(handle, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                              &alignment, sizeof(alignment), &size, NULL);
+        ok(!ret, "directory StorageAccessAlignmentProperty query unexpectedly succeeded\n");
+        CloseHandle(handle);
+    }
+
+    size = 0xdeadbeef;
+    SetLastError(0xdeadbeef);
+    ret = DeviceIoControl(INVALID_HANDLE_VALUE, IOCTL_STORAGE_QUERY_PROPERTY, &query, sizeof(query),
+                          &alignment, sizeof(alignment), &size, NULL);
+    error = GetLastError();
+    ok(!ret, "invalid handle StorageAccessAlignmentProperty query unexpectedly succeeded\n");
+    ok(error == ERROR_INVALID_HANDLE, "invalid handle returned error %#lx\n", error);
+}
+
 static void test_GetVolumePathNameA(void)
 {
     char volume_path[MAX_PATH], cwd[MAX_PATH], expect_path[MAX_PATH];
@@ -2212,6 +2393,7 @@ START_TEST(volume)
     test_enum_vols();
     test_disk_extents();
     test_disk_query_property();
+    test_fixed_storage_properties();
     test_GetVolumePathNamesForVolumeNameA();
     test_GetVolumePathNamesForVolumeNameW();
     test_cdrom_ioctl();

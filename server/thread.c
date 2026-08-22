@@ -61,6 +61,8 @@
 #include "user.h"
 #include "security.h"
 
+#include "esync.h"
+#include <sys/eventfd.h>
 #include "fsync.h"
 
 /* thread queues */
@@ -134,6 +136,7 @@ struct context
     struct object           obj;        /* object header */
     struct object          *sync;       /* sync object for wait/signal */
     unsigned int            status;     /* status of the context */
+    int                     cooperative;/* waiting for the cooperative suspend */
     struct context_data     regs[2];    /* context data */
 };
 #define CTX_NATIVE  0  /* context for native machine */
@@ -446,6 +449,7 @@ static inline void init_thread_structure( struct thread *thread )
 
 static inline int is_thread_suspended( struct thread *thread )
 {
+    if (thread->context && thread->context->cooperative) return 0;
     if (thread->suspend) return 1;
     return !thread->bypass_proc_suspend && thread->process->suspend;
 }
@@ -486,8 +490,9 @@ static struct context *create_thread_context( struct thread *thread )
 {
     struct context *context;
     if (!(context = alloc_object( &context_ops ))) return NULL;
-    context->sync   = NULL;
-    context->status = STATUS_PENDING;
+    context->sync        = NULL;
+    context->status      = STATUS_PENDING;
+    context->cooperative = 0;
     memset( &context->regs, 0, sizeof(context->regs) );
     context->regs[CTX_NATIVE].machine = native_machine;
 
@@ -1193,6 +1198,12 @@ static int check_wait( struct thread *thread )
     if ((wait->flags & SELECT_INTERRUPTIBLE) && !list_empty( &thread->system_apc ))
         return STATUS_KERNEL_APC;
 
+    if ((wait->flags & SELECT_COOPERATIVE_SUSPEND) && thread->context)
+    {
+        thread->context->cooperative = 1;
+        return STATUS_THREAD_WAS_SUSPENDED;
+    }
+
     /* Suspended threads may not acquire locks, but they can run system APCs */
     if (is_thread_suspended( thread )) return -1;
 
@@ -1826,6 +1837,11 @@ DECL_HANDLER(init_first_thread)
     {
         reply->inproc_device = FSYNC_USED_BY_SERVER;
     }
+	else if (do_esync())
+    {
+        reply->inproc_device = ESYNC_USED_BY_SERVER;
+		send_client_fd(process, esync_get_shm_fd(), reply->inproc_device);
+    }
     else if ((fd = get_inproc_device_fd()) >= 0)
     {
         reply->inproc_device = get_process_id( process ) | 1;
@@ -2058,6 +2074,7 @@ DECL_HANDLER(select)
             copy_context( &ctx->regs[CTX_WOW], wow_context, wow_context->flags & ~ctx->regs[CTX_WOW].flags );
         }
         ctx->status = STATUS_SUCCESS;
+        ctx->cooperative = 0;
         current->suspend_cookie = req->cookie;
         signal_sync( ctx->sync );
     }
@@ -2468,7 +2485,7 @@ DECL_HANDLER(get_inproc_alert_fd)
     int fd;
 
     if ((fd = get_inproc_sync_fd( current->alert_sync )) < 0) set_error( STATUS_INVALID_PARAMETER );
-    else if (do_fsync()) reply->fsync_shm_idx = fd;
+    else if (do_fsync()) reply->sync_shm_idx = fd;
     else
     {
         reply->handle = get_thread_id( current ) | 1; /* arbitrary token */

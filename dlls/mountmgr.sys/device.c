@@ -1538,11 +1538,21 @@ static NTSTATUS query_property( struct disk_device *device, IRP *irp )
         return STATUS_INVALID_PARAMETER;
     }
 
-    /* Try to persuade application not to check property */
     if (query->QueryType == PropertyExistsQuery)
     {
-        return STATUS_NOT_SUPPORTED;
+        switch (query->PropertyId)
+        {
+        case StorageDeviceProperty:
+        case StorageAdapterProperty:
+        case StorageAccessAlignmentProperty:
+        case StorageDeviceSeekPenaltyProperty:
+            irp->IoStatus.Information = 0;
+            return STATUS_SUCCESS;
+        default:
+            return STATUS_NOT_SUPPORTED;
+        }
     }
+    if (query->QueryType != PropertyStandardQuery) return STATUS_NOT_SUPPORTED;
 
     switch (query->PropertyId)
     {
@@ -1590,6 +1600,63 @@ static NTSTATUS query_property( struct disk_device *device, IRP *irp )
             status = STATUS_SUCCESS;
         }
 
+        break;
+    }
+    case StorageAdapterProperty:
+    {
+        STORAGE_ADAPTER_DESCRIPTOR *descriptor = irp->AssociatedIrp.SystemBuffer;
+        DWORD len = sizeof(*descriptor);
+
+        if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(STORAGE_DESCRIPTOR_HEADER))
+            status = STATUS_INVALID_PARAMETER;
+        else if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < len)
+        {
+            descriptor->Version = len;
+            descriptor->Size = len;
+            irp->IoStatus.Information = sizeof(STORAGE_DESCRIPTOR_HEADER);
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            FIXME( "Faking StorageAdapterProperty data\n" );
+
+            memset( descriptor, 0, len );
+            descriptor->Version = len;
+            descriptor->Size = len;
+            descriptor->MaximumTransferLength = 64 * 1024;
+            descriptor->MaximumPhysicalPages = 17;
+            descriptor->BusType = BusTypeScsi;
+            irp->IoStatus.Information = len;
+            status = STATUS_SUCCESS;
+        }
+        break;
+    }
+    case StorageAccessAlignmentProperty:
+    {
+        STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR *descriptor = irp->AssociatedIrp.SystemBuffer;
+        DWORD len = sizeof(*descriptor);
+
+        if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(STORAGE_DESCRIPTOR_HEADER))
+            status = STATUS_INVALID_PARAMETER;
+        else if (irpsp->Parameters.DeviceIoControl.OutputBufferLength < len)
+        {
+            descriptor->Version = len;
+            descriptor->Size = len;
+            irp->IoStatus.Information = sizeof(STORAGE_DESCRIPTOR_HEADER);
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            FIXME( "Faking StorageAccessAlignmentProperty data\n" );
+
+            memset( descriptor, 0, len );
+            descriptor->Version = len;
+            descriptor->Size = len;
+            descriptor->BytesPerLogicalSector = 512;
+            descriptor->BytesPerPhysicalSector = 512;
+            irp->IoStatus.Information = len;
+            status = STATUS_SUCCESS;
+        }
         break;
     }
     case StorageDeviceSeekPenaltyProperty:

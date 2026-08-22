@@ -1614,8 +1614,9 @@ struct select_reply
     /* VARARG(call,apc_call); */
     /* VARARG(contexts,contexts); */
 };
-#define SELECT_ALERTABLE     1
-#define SELECT_INTERRUPTIBLE 2
+#define SELECT_ALERTABLE           1
+#define SELECT_INTERRUPTIBLE       2
+#define SELECT_COOPERATIVE_SUSPEND 4
 
 
 
@@ -7093,6 +7094,6 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 930
+#define SERVER_PROTOCOL_VERSION 931
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
