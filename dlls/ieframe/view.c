@@ -23,6 +23,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(ieframe);
 
+#define CAPTURE_WINDOW_ROP (SRCCOPY | 0x40000000) /* CAPTUREBLT */
+
 /**********************************************************************
  * Implement the IViewObject interface
  */
@@ -50,6 +52,63 @@ static ULONG WINAPI ViewObject_Release(IViewObject2 *iface)
     return IUnknown_Release(This->hlink_frame.outer);
 }
 
+static HRESULT capture_window_tree(HWND hwnd, HWND root, const RECT *parent_clip, HDC hdc,
+        BOOL (STDMETHODCALLTYPE *continue_func)(ULONG_PTR), ULONG_PTR continue_cookie,
+        BOOL *copied)
+{
+    RECT client_rect, window_rect, clip_rect;
+    POINT origin = {0, 0};
+    HWND child, next;
+    HDC window_dc;
+
+    if (!IsWindow(hwnd) || !IsWindowVisible(hwnd))
+        return S_OK;
+    if (continue_func && !continue_func(continue_cookie))
+        return E_ABORT;
+    if (!GetClientRect(hwnd, &client_rect))
+        return VIEW_E_DRAW;
+    if (IsRectEmpty(&client_rect))
+        return S_OK;
+
+    SetLastError(ERROR_SUCCESS);
+    if (!MapWindowPoints(hwnd, root, &origin, 1) && GetLastError() != ERROR_SUCCESS)
+        return VIEW_E_DRAW;
+    SetRect(&window_rect, origin.x, origin.y, origin.x + client_rect.right,
+            origin.y + client_rect.bottom);
+    if (!IntersectRect(&clip_rect, &window_rect, parent_clip))
+        return S_OK;
+
+    window_dc = GetDC(hwnd);
+    if (!window_dc)
+        return VIEW_E_DRAW;
+    if (!BitBlt(hdc, clip_rect.left, clip_rect.top,
+            clip_rect.right - clip_rect.left, clip_rect.bottom - clip_rect.top,
+            window_dc, clip_rect.left - origin.x, clip_rect.top - origin.y,
+            CAPTURE_WINDOW_ROP))
+    {
+        ReleaseDC(hwnd, window_dc);
+        return VIEW_E_DRAW;
+    }
+    ReleaseDC(hwnd, window_dc);
+    *copied = TRUE;
+
+    child = GetWindow(hwnd, GW_CHILD);
+    if (child)
+        child = GetWindow(child, GW_HWNDLAST);
+    while (child)
+    {
+        HRESULT hr;
+
+        next = GetWindow(child, GW_HWNDPREV);
+        hr = capture_window_tree(child, root, &clip_rect, hdc, continue_func,
+                continue_cookie, copied);
+        if (FAILED(hr))
+            return hr;
+        child = next;
+    }
+    return S_OK;
+}
+
 static HRESULT WINAPI ViewObject_Draw(IViewObject2 *iface, DWORD dwDrawAspect,
         LONG lindex, void *pvAspect, DVTARGETDEVICE *ptd, HDC hdcTargetDev,
         HDC hdcDraw, LPCRECTL lprcBounds, LPCRECTL lprcWBounds,
@@ -57,10 +116,84 @@ static HRESULT WINAPI ViewObject_Draw(IViewObject2 *iface, DWORD dwDrawAspect,
         ULONG_PTR dwContinue)
 {
     WebBrowser *This = impl_from_IViewObject2(iface);
-    FIXME("(%p)->(%ld %ld %p %p %p %p %p %p %p %08Ix)\n", This, dwDrawAspect, lindex,
+    HBITMAP bitmap, old_bitmap;
+    HDC capture_dc;
+    RECT capture_rect;
+    HRESULT hr;
+    BOOL copied = FALSE;
+    INT old_stretch_mode;
+
+    TRACE("(%p)->(%ld %ld %p %p %p %p %p %p %p %08Ix)\n", This, dwDrawAspect, lindex,
             pvAspect, ptd, hdcTargetDev, hdcDraw, lprcBounds, lprcWBounds, pfnContinue,
             dwContinue);
-    return S_OK;
+
+    if (dwDrawAspect != DVASPECT_CONTENT)
+        return DV_E_DVASPECT;
+    if (lindex != -1)
+        return DV_E_LINDEX;
+    if (!hdcDraw || !lprcBounds)
+        return E_INVALIDARG;
+    if (lprcBounds->right <= lprcBounds->left
+            || lprcBounds->bottom <= lprcBounds->top)
+        return OLE_E_INVALIDRECT;
+    if (!This->doc_host.document)
+        return OLE_E_BLANK;
+    if (pfnContinue && !pfnContinue(dwContinue))
+        return E_ABORT;
+    if (!IsWindow(This->shell_embedding_hwnd))
+        return VIEW_E_DRAW;
+    if (!RedrawWindow(This->shell_embedding_hwnd, NULL, NULL,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW))
+        return VIEW_E_DRAW;
+    if (!This->doc_host.document)
+        return OLE_E_BLANK;
+    if (!IsWindow(This->shell_embedding_hwnd)
+            || !GetClientRect(This->shell_embedding_hwnd, &capture_rect)
+            || IsRectEmpty(&capture_rect))
+        return VIEW_E_DRAW;
+
+    capture_dc = CreateCompatibleDC(hdcDraw);
+    if (!capture_dc)
+        return VIEW_E_DRAW;
+    bitmap = CreateCompatibleBitmap(hdcDraw, capture_rect.right, capture_rect.bottom);
+    if (!bitmap)
+    {
+        DeleteDC(capture_dc);
+        return VIEW_E_DRAW;
+    }
+    old_bitmap = SelectObject(capture_dc, bitmap);
+    if (!old_bitmap || old_bitmap == HGDI_ERROR)
+    {
+        DeleteObject(bitmap);
+        DeleteDC(capture_dc);
+        return VIEW_E_DRAW;
+    }
+
+    if (!FillRect(capture_dc, &capture_rect, (HBRUSH)(COLOR_WINDOW + 1)))
+        hr = VIEW_E_DRAW;
+    else
+        hr = capture_window_tree(This->shell_embedding_hwnd, This->shell_embedding_hwnd,
+                &capture_rect, capture_dc, pfnContinue, dwContinue, &copied);
+    if (SUCCEEDED(hr) && !copied)
+        hr = VIEW_E_DRAW;
+    if (SUCCEEDED(hr) && pfnContinue && !pfnContinue(dwContinue))
+        hr = E_ABORT;
+    if (SUCCEEDED(hr))
+    {
+        old_stretch_mode = SetStretchBltMode(hdcDraw, COLORONCOLOR);
+        if (!StretchBlt(hdcDraw, lprcBounds->left, lprcBounds->top,
+                lprcBounds->right - lprcBounds->left,
+                lprcBounds->bottom - lprcBounds->top, capture_dc, 0, 0,
+                capture_rect.right, capture_rect.bottom, SRCCOPY))
+            hr = VIEW_E_DRAW;
+        if (old_stretch_mode)
+            SetStretchBltMode(hdcDraw, old_stretch_mode);
+    }
+
+    SelectObject(capture_dc, old_bitmap);
+    DeleteObject(bitmap);
+    DeleteDC(capture_dc);
+    return hr;
 }
 
 static HRESULT WINAPI ViewObject_GetColorSet(IViewObject2 *iface, DWORD dwAspect,

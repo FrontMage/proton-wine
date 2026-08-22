@@ -1438,13 +1438,13 @@ static HRESULT WINAPI InPlaceSite_OnUIActivate(IOleInPlaceSiteEx *iface)
     return S_OK;
 }
 
+static const RECT inplace_pos_rect = {2,1,1002,901};
+static const RECT inplace_clip_rect = {10,10,990,890};
+
 static HRESULT WINAPI InPlaceSite_GetWindowContext(IOleInPlaceSiteEx *iface,
         IOleInPlaceFrame **ppFrame, IOleInPlaceUIWindow **ppDoc, LPRECT lprcPosRect,
         LPRECT lprcClipRect, LPOLEINPLACEFRAMEINFO lpFrameInfo)
 {
-    static const RECT pos_rect = {2,1,1002,901};
-    static const RECT clip_rect = {10,10,990,890};
-
     CHECK_EXPECT(GetWindowContext);
 
     ok(ppFrame != NULL, "ppFrame = NULL\n");
@@ -1457,11 +1457,11 @@ static HRESULT WINAPI InPlaceSite_GetWindowContext(IOleInPlaceSiteEx *iface,
 
     ok(lprcPosRect != NULL, "lprcPosRect = NULL\n");
     if(lprcPosRect)
-        memcpy(lprcPosRect, &pos_rect, sizeof(RECT));
+        memcpy(lprcPosRect, &inplace_pos_rect, sizeof(RECT));
 
     ok(lprcClipRect != NULL, "lprcClipRect = NULL\n");
     if(lprcClipRect)
-        memcpy(lprcClipRect, &clip_rect, sizeof(RECT));
+        memcpy(lprcClipRect, &inplace_clip_rect, sizeof(RECT));
 
     ok(lpFrameInfo != NULL, "lpFrameInfo = NULL\n");
     if(lpFrameInfo) {
@@ -3840,6 +3840,343 @@ static void init_test(IWebBrowser2 *webbrowser, DWORD flags)
     use_container_dochostui = !(flags & TEST_NODOCHOST);
 }
 
+#define DRAW_TEST_WIDTH  251
+#define DRAW_TEST_HEIGHT 263
+#define DRAW_TEST_SENTINEL 0x005a17c3
+
+struct draw_test_surface
+{
+    HDC hdc;
+    HBITMAP bitmap;
+    HBITMAP old_bitmap;
+    DWORD *bits;
+};
+
+static BOOL init_draw_test_surface(struct draw_test_surface *surface)
+{
+    BITMAPINFO info;
+
+    memset(surface, 0, sizeof(*surface));
+    memset(&info, 0, sizeof(info));
+    info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = DRAW_TEST_WIDTH;
+    info.bmiHeader.biHeight = -DRAW_TEST_HEIGHT;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+
+    surface->hdc = CreateCompatibleDC(NULL);
+    surface->bitmap = CreateDIBSection(surface->hdc, &info, DIB_RGB_COLORS,
+            (void **)&surface->bits, NULL, 0);
+    if (!surface->hdc || !surface->bitmap || !surface->bits)
+        return FALSE;
+    surface->old_bitmap = SelectObject(surface->hdc, surface->bitmap);
+    return surface->old_bitmap && surface->old_bitmap != HGDI_ERROR;
+}
+
+static void reset_draw_test_surface(struct draw_test_surface *surface)
+{
+    unsigned int i;
+
+    for (i = 0; i < DRAW_TEST_WIDTH * DRAW_TEST_HEIGHT; ++i)
+        surface->bits[i] = DRAW_TEST_SENTINEL;
+    GdiFlush();
+}
+
+static void destroy_draw_test_surface(struct draw_test_surface *surface)
+{
+    if (surface->hdc && surface->old_bitmap && surface->old_bitmap != HGDI_ERROR)
+        SelectObject(surface->hdc, surface->old_bitmap);
+    if (surface->bitmap)
+        DeleteObject(surface->bitmap);
+    if (surface->hdc)
+        DeleteDC(surface->hdc);
+}
+
+static DWORD draw_test_pixel(const struct draw_test_surface *surface, int x, int y)
+{
+    GdiFlush();
+    return surface->bits[y * DRAW_TEST_WIDTH + x] & 0x00ffffff;
+}
+
+static unsigned int draw_test_changed_outside(const struct draw_test_surface *surface,
+        const RECTL *bounds)
+{
+    unsigned int changed = 0;
+    int x, y;
+
+    GdiFlush();
+    for (y = 0; y < DRAW_TEST_HEIGHT; ++y)
+    {
+        for (x = 0; x < DRAW_TEST_WIDTH; ++x)
+        {
+            if ((x < bounds->left || x >= bounds->right
+                    || y < bounds->top || y >= bounds->bottom)
+                    && (surface->bits[y * DRAW_TEST_WIDTH + x] & 0x00ffffff)
+                    != DRAW_TEST_SENTINEL)
+                ++changed;
+        }
+    }
+    return changed;
+}
+
+static void check_draw_test_pixels(const struct draw_test_surface *surface,
+        const RECTL *bounds, DWORD background, const char *name)
+{
+    int quarter_x = (bounds->right - bounds->left) / 4;
+    int quarter_y = (bounds->bottom - bounds->top) / 4;
+    DWORD color;
+
+    color = draw_test_pixel(surface, bounds->left + quarter_x, bounds->top + quarter_y);
+    ok(color == 0x00ff0000, "%s: top-left color %#lx\n", name, color);
+    color = draw_test_pixel(surface, bounds->right - quarter_x, bounds->top + quarter_y);
+    ok(color == 0x0000ff00, "%s: top-right color %#lx\n", name, color);
+    color = draw_test_pixel(surface, bounds->left + quarter_x, bounds->bottom - quarter_y);
+    ok(color == 0x000000ff, "%s: bottom-left color %#lx\n", name, color);
+    color = draw_test_pixel(surface, bounds->right - quarter_x, bounds->bottom - quarter_y);
+    ok(color == background, "%s: bottom-right color %#lx\n", name, color);
+    ok(!draw_test_changed_outside(surface, bounds), "%s: pixels changed outside bounds\n", name);
+}
+
+static unsigned int draw_continue_count;
+
+static BOOL STDMETHODCALLTYPE draw_continue_cancel_third(ULONG_PTR cookie)
+{
+    ok(cookie == 0x12345678, "unexpected continue cookie %08Ix\n", cookie);
+    ++draw_continue_count;
+    return draw_continue_count < 3;
+}
+
+static void set_draw_test_background(IHTMLStyle *style, INT color)
+{
+    VARIANT value;
+    HRESULT hres;
+
+    VariantInit(&value);
+    V_VT(&value) = VT_INT;
+    V_INT(&value) = color;
+    hres = IHTMLStyle_put_backgroundColor(style, value);
+    ok(hres == S_OK, "put_backgroundColor failed: %08lx\n", hres);
+}
+
+static void test_ViewObjectDraw_loaded(IWebBrowser2 *webbrowser)
+{
+    static const WCHAR blocks_html[] =
+        L"<div style=\"position:absolute;left:0;top:0;width:50%;height:50%;"
+        L"background-color:#ff0000\"></div>"
+        L"<div style=\"position:absolute;left:50%;top:0;width:50%;height:50%;"
+        L"background-color:#00ff00\"></div>"
+        L"<div style=\"position:absolute;left:0;top:50%;width:50%;height:50%;"
+        L"background-color:#0000ff\"></div>";
+    const RECTL bounds = {17, 19, 217, 239};
+    const RECT ole_bounds = {17, 19, 217, 239};
+    struct draw_test_surface surface;
+    IHTMLDocument2 *document = NULL;
+    IHTMLElement *body = NULL;
+    IHTMLStyle *style = NULL;
+    IViewObject2 *view = NULL;
+    IOleInPlaceObject *inplace = NULL;
+    IDispatch *dispatch = NULL;
+    HWND browser_parent;
+    BOOL container_was_visible, restore_container_visibility = FALSE;
+    BOOL restore_browser_rect = FALSE;
+    RECT browser_rect, test_browser_rect;
+    BSTR str = NULL;
+    DWORD error;
+    HRESULT hres;
+
+    if (!init_draw_test_surface(&surface))
+    {
+        win_skip("Could not create IViewObject::Draw test surface\n");
+        destroy_draw_test_surface(&surface);
+        return;
+    }
+
+    hres = IWebBrowser2_QueryInterface(webbrowser, &IID_IViewObject2, (void **)&view);
+    ok(hres == S_OK, "QueryInterface(IViewObject2) failed: %08lx\n", hres);
+    if (FAILED(hres))
+        goto cleanup;
+
+    hres = IWebBrowser2_QueryInterface(webbrowser, &IID_IOleInPlaceObject, (void **)&inplace);
+    ok(hres == S_OK, "QueryInterface(IOleInPlaceObject) failed: %08lx\n", hres);
+    if (FAILED(hres))
+        goto cleanup;
+
+    hres = IWebBrowser2_get_Document(webbrowser, &dispatch);
+    ok(hres == S_OK, "get_Document failed: %08lx\n", hres);
+    ok(dispatch != NULL, "document dispatch is NULL\n");
+    if (FAILED(hres) || !dispatch)
+        goto cleanup;
+    hres = IDispatch_QueryInterface(dispatch, &IID_IHTMLDocument2, (void **)&document);
+    ok(hres == S_OK, "QueryInterface(IHTMLDocument2) failed: %08lx\n", hres);
+    IDispatch_Release(dispatch);
+    dispatch = NULL;
+    if (FAILED(hres))
+        goto cleanup;
+    hres = IHTMLDocument2_get_body(document, &body);
+    ok(hres == S_OK, "get_body failed: %08lx\n", hres);
+    ok(body != NULL, "body is NULL\n");
+    if (FAILED(hres) || !body)
+        goto cleanup;
+    hres = IHTMLElement_get_style(body, &style);
+    ok(hres == S_OK, "get_style failed: %08lx\n", hres);
+    ok(style != NULL, "style is NULL\n");
+    if (FAILED(hres) || !style)
+        goto cleanup;
+
+    str = SysAllocString(L"margin:0;overflow:hidden");
+    ok(str != NULL, "SysAllocString failed\n");
+    if (!str)
+        goto cleanup;
+    hres = IHTMLStyle_put_cssText(style, str);
+    ok(hres == S_OK, "put_cssText failed: %08lx\n", hres);
+    SysFreeString(str);
+    str = NULL;
+    if (FAILED(hres))
+        goto cleanup;
+    str = SysAllocString(blocks_html);
+    ok(str != NULL, "SysAllocString failed\n");
+    if (!str)
+        goto cleanup;
+    hres = IHTMLElement_put_innerHTML(body, str);
+    ok(hres == S_OK, "put_innerHTML failed: %08lx\n", hres);
+    SysFreeString(str);
+    str = NULL;
+    if (FAILED(hres))
+        goto cleanup;
+
+    browser_parent = GetParent(shell_embedding_hwnd);
+    ok(browser_parent != NULL, "browser parent is NULL\n");
+    if (!browser_parent)
+        goto cleanup;
+    if (!GetWindowRect(shell_embedding_hwnd, &browser_rect))
+    {
+        ok(0, "GetWindowRect failed: %lu\n", GetLastError());
+        goto cleanup;
+    }
+    SetLastError(ERROR_SUCCESS);
+    if (!MapWindowPoints(HWND_DESKTOP, browser_parent, (POINT *)&browser_rect, 2)
+            && (error = GetLastError()) != ERROR_SUCCESS)
+    {
+        ok(0, "MapWindowPoints failed: %lu\n", error);
+        goto cleanup;
+    }
+    test_browser_rect = browser_rect;
+    test_browser_rect.right = test_browser_rect.left + 320;
+    test_browser_rect.bottom = test_browser_rect.top + 320;
+    hres = IOleInPlaceObject_SetObjectRects(inplace, &test_browser_rect, &test_browser_rect);
+    ok(hres == S_OK, "SetObjectRects failed: %08lx\n", hres);
+    if (FAILED(hres))
+        goto cleanup;
+    restore_browser_rect = TRUE;
+
+    container_was_visible = IsWindowVisible(container_hwnd);
+    if (!container_was_visible)
+    {
+        ShowWindow(container_hwnd, SW_SHOWNOACTIVATE);
+        restore_container_visibility = TRUE;
+    }
+    UpdateWindow(container_hwnd);
+    RedrawWindow(container_hwnd, NULL, NULL,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+
+    set_draw_test_background(style, 0x00ffffff);
+    reset_draw_test_surface(&surface);
+    hres = IViewObject2_Draw(view, DVASPECT_CONTENT, -1, NULL, NULL, NULL,
+            surface.hdc, &bounds, NULL, NULL, 0);
+    ok(hres == S_OK, "Draw returned: %08lx\n", hres);
+    if (hres == S_OK)
+        check_draw_test_pixels(&surface, &bounds, 0x00ffffff, "Draw");
+
+    reset_draw_test_surface(&surface);
+    draw_continue_count = 0;
+    hres = IViewObject2_Draw(view, DVASPECT_CONTENT, -1, NULL, NULL, NULL,
+            surface.hdc, &bounds, NULL, draw_continue_cancel_third, 0x12345678);
+    ok(hres == E_ABORT, "cancelled Draw returned: %08lx\n", hres);
+    ok(draw_continue_count == 3, "continue callback called %u times\n", draw_continue_count);
+    ok(!draw_test_changed_outside(&surface, &(RECTL){0, 0, 0, 0}),
+            "cancelled Draw changed target pixels\n");
+
+    set_draw_test_background(style, 0x00000000);
+    reset_draw_test_surface(&surface);
+    hres = OleDraw((IUnknown *)webbrowser, DVASPECT_CONTENT, surface.hdc, &ole_bounds);
+    ok(hres == S_OK, "OleDraw returned: %08lx\n", hres);
+    if (hres == S_OK)
+        check_draw_test_pixels(&surface, &bounds, 0x00000000, "OleDraw");
+
+cleanup:
+    if (restore_browser_rect)
+    {
+        hres = IOleInPlaceObject_SetObjectRects(inplace, &browser_rect, &inplace_clip_rect);
+        ok(hres == S_OK, "restoring object rect failed: %08lx\n", hres);
+    }
+    if (restore_container_visibility)
+        ShowWindow(container_hwnd, SW_HIDE);
+    SysFreeString(str);
+    if (dispatch)
+        IDispatch_Release(dispatch);
+    if (style)
+        IHTMLStyle_Release(style);
+    if (body)
+        IHTMLElement_Release(body);
+    if (document)
+        IHTMLDocument2_Release(document);
+    if (view)
+        IViewObject2_Release(view);
+    if (inplace)
+        IOleInPlaceObject_Release(inplace);
+    destroy_draw_test_surface(&surface);
+}
+
+static void test_ViewObjectDraw_empty(IViewObject2 *view)
+{
+    const RECTL bounds = {3, 5, 43, 47};
+    const RECTL empty_bounds = {3, 5, 3, 47};
+    const RECTL inverted_bounds = {43, 47, 3, 5};
+    struct draw_test_surface surface;
+    HRESULT hres;
+
+    if (!init_draw_test_surface(&surface))
+    {
+        win_skip("Could not create empty IViewObject::Draw test surface\n");
+        destroy_draw_test_surface(&surface);
+        return;
+    }
+
+    reset_draw_test_surface(&surface);
+    hres = IViewObject2_Draw(view, DVASPECT_ICON, -1, NULL, NULL, NULL,
+            surface.hdc, &bounds, NULL, NULL, 0);
+    ok(hres == DV_E_DVASPECT, "wrong-aspect Draw returned: %08lx\n", hres);
+
+    hres = IViewObject2_Draw(view, DVASPECT_CONTENT, 0, NULL, NULL, NULL,
+            surface.hdc, &bounds, NULL, NULL, 0);
+    ok(hres == DV_E_LINDEX, "wrong-lindex Draw returned: %08lx\n", hres);
+
+    hres = IViewObject2_Draw(view, DVASPECT_CONTENT, -1, NULL, NULL, NULL,
+            NULL, &bounds, NULL, NULL, 0);
+    ok(hres == E_INVALIDARG, "null-DC Draw returned: %08lx\n", hres);
+
+    hres = IViewObject2_Draw(view, DVASPECT_CONTENT, -1, NULL, NULL, NULL,
+            surface.hdc, NULL, NULL, NULL, 0);
+    ok(hres == E_INVALIDARG, "null-bounds Draw returned: %08lx\n", hres);
+
+    hres = IViewObject2_Draw(view, DVASPECT_CONTENT, -1, NULL, NULL, NULL,
+            surface.hdc, &empty_bounds, NULL, NULL, 0);
+    ok(hres == OLE_E_INVALIDRECT, "empty-bounds Draw returned: %08lx\n", hres);
+
+    hres = IViewObject2_Draw(view, DVASPECT_CONTENT, -1, NULL, NULL, NULL,
+            surface.hdc, &inverted_bounds, NULL, NULL, 0);
+    ok(hres == OLE_E_INVALIDRECT, "inverted-bounds Draw returned: %08lx\n", hres);
+
+    hres = IViewObject2_Draw(view, DVASPECT_CONTENT, -1, NULL, NULL, NULL,
+            surface.hdc, &bounds, NULL, NULL, 0);
+    ok(hres == OLE_E_BLANK, "documentless Draw returned: %08lx\n", hres);
+    ok(!draw_test_changed_outside(&surface, &(RECTL){0, 0, 0, 0}),
+            "documentless Draw changed target pixels\n");
+
+    destroy_draw_test_surface(&surface);
+}
+
 static void test_WebBrowser(DWORD flags, BOOL do_close)
 {
     IWebBrowser2 *webbrowser;
@@ -3883,6 +4220,7 @@ static void test_WebBrowser(DWORD flags, BOOL do_close)
         IHTMLDocument2 *doc, *doc2;
 
         test_download(0);
+        test_ViewObjectDraw_loaded(webbrowser);
         test_olecmd(webbrowser, TRUE);
         doc = get_document(webbrowser);
 
@@ -4371,6 +4709,8 @@ static void test_SetAdvise(void)
     hr = IWebBrowser2_QueryInterface(browser, &IID_IViewObject2, (void **)&view);
     ok(hr == S_OK, "got %08lx\n", hr);
     if (FAILED(hr)) return;
+
+    test_ViewObjectDraw_empty(view);
 
     aspects = flags = 0xdeadbeef;
     sink = (IAdviseSink *)0xdeadbeef;
