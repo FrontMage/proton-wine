@@ -817,12 +817,49 @@ static DWORD get_service_binary_path(const struct service_entry *service_entry, 
     return ERROR_SUCCESS;
 }
 
+static BOOL get_binary_machine(const WCHAR *path, USHORT *machine)
+{
+    SECTION_IMAGE_INFORMATION info;
+    HANDLE file, mapping;
+    NTSTATUS status;
+
+    *machine = IMAGE_FILE_MACHINE_UNKNOWN;
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                       NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    status = NtCreateSection(&mapping, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY,
+                             NULL, NULL, PAGE_READONLY, SEC_IMAGE, file);
+    CloseHandle(file);
+    if (status)
+        return FALSE;
+
+    status = NtQuerySection(mapping, SectionImageInformation, &info, sizeof(info), NULL);
+    CloseHandle(mapping);
+    if (status)
+        return FALSE;
+
+    *machine = info.Machine;
+    return TRUE;
+}
+
 static DWORD get_winedevice_binary_path(struct service_entry *service_entry, WCHAR **path, BOOL *is_wow64)
 {
+    const WCHAR *host_name = L"\\winedevice.exe";
     WCHAR system_dir[MAX_PATH];
+    USHORT machine = IMAGE_FILE_MACHINE_UNKNOWN;
     DWORD type;
 
-    if (!is_win64)
+    if (get_binary_machine(*path, &machine))
+    {
+        *is_wow64 = (machine == IMAGE_FILE_MACHINE_I386 || machine == IMAGE_FILE_MACHINE_ARMNT);
+#ifdef __aarch64__
+        if (machine == IMAGE_FILE_MACHINE_AMD64)
+            host_name = L"\\winedevice-x64.exe";
+#endif
+    }
+    else if (!is_win64)
         *is_wow64 = FALSE;
     else if (GetBinaryTypeW(*path, &type))
         *is_wow64 = (type == SCS_32BIT_BINARY);
@@ -831,11 +868,12 @@ static DWORD get_winedevice_binary_path(struct service_entry *service_entry, WCH
 
     GetSystemDirectoryW(system_dir, MAX_PATH);
     free(*path);
-    if (!(*path = malloc(wcslen(system_dir) * sizeof(WCHAR) + sizeof(L"\\winedevice.exe"))))
+    if (!(*path = malloc((wcslen(system_dir) + wcslen(host_name) + 1) * sizeof(WCHAR))))
        return ERROR_NOT_ENOUGH_SERVER_MEMORY;
 
     lstrcpyW(*path, system_dir);
-    lstrcatW(*path, L"\\winedevice.exe");
+    lstrcatW(*path, host_name);
+    TRACE("driver machine %04x uses host %s\n", machine, debugstr_w(*path));
     return ERROR_SUCCESS;
 }
 
