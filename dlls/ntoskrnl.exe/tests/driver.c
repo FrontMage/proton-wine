@@ -295,7 +295,6 @@ static void test_mdl_map(void)
     MmUnmapLockedPages(addr, mdl);
 
     addr = MmMapLockedPagesSpecifyCache(mdl, KernelMode, MmCached, NULL, FALSE, NormalPagePriority);
-    todo_wine
     ok(addr != NULL, "MmMapLockedPagesSpecifyCache failed\n");
     if (addr != NULL)
         ok(!kmemcmp(addr, buffer, sizeof(buffer)), "Unexpected data in mapped memory\n");
@@ -304,6 +303,25 @@ static void test_mdl_map(void)
 
     MmUnlockPages(mdl);
     IoFreeMdl(mdl);
+}
+
+static void test_interlocked_insert_tail_list(void)
+{
+    LIST_ENTRY list, first, second;
+    KSPIN_LOCK lock;
+    LIST_ENTRY *ret;
+
+    InitializeListHead(&list);
+    KeInitializeSpinLock(&lock);
+
+    ret = ExInterlockedInsertTailList(&list, &first, &lock);
+    ok(ret == NULL, "expected NULL previous tail, got %p\n", ret);
+    ok(list.Flink == &first && list.Blink == &first, "unexpected first insertion\n");
+
+    ret = ExInterlockedInsertTailList(&list, &second, &lock);
+    ok(ret == &first, "expected first previous tail, got %p\n", ret);
+    ok(list.Flink == &first && list.Blink == &second && first.Flink == &second &&
+       second.Blink == &first, "unexpected second insertion\n");
 }
 
 static void test_init_funcs(void)
@@ -2468,6 +2486,7 @@ static NTSTATUS main_test(DEVICE_OBJECT *device, IRP *irp, IO_STACK_LOCATION *st
     test_current_thread(FALSE);
     test_critical_region(TRUE);
     test_mdl_map();
+    test_interlocked_insert_tail_list();
     test_init_funcs();
     test_load_driver();
     test_sync();

@@ -783,6 +783,7 @@ static NTSTATUS dispatch_ioctl( struct dispatch_context *context )
 
     irp->Flags |= IRP_DEALLOCATE_BUFFER;  /* deallocate in_buff */
     status = dispatch_irp( device, irp, context );
+    TRACE( "ioctl %x returned %#lx\n", context->params.ioctl.code, status );
 
     HeapFree( GetProcessHeap(), 0, to_free );
     return status;
@@ -2970,9 +2971,9 @@ PVOID WINAPI MmMapLockedPages( MDL *mdl, KPROCESSOR_MODE mode )
 PVOID WINAPI  MmMapLockedPagesSpecifyCache(PMDLX MemoryDescriptorList, KPROCESSOR_MODE AccessMode, MEMORY_CACHING_TYPE CacheType,
                                            PVOID BaseAddress, ULONG BugCheckOnFailure, MM_PAGE_PRIORITY Priority)
 {
-    FIXME("(%p, %u, %u, %p, %lu, %u): stub\n", MemoryDescriptorList, AccessMode, CacheType, BaseAddress, BugCheckOnFailure, Priority);
+    TRACE("(%p, %u, %u, %p, %lu, %u)\n", MemoryDescriptorList, AccessMode, CacheType, BaseAddress, BugCheckOnFailure, Priority);
 
-    return NULL;
+    return MmMapLockedPages((MDL *)MemoryDescriptorList, AccessMode);
 }
 
 /***********************************************************************

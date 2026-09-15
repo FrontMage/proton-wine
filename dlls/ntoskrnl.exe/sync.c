@@ -761,6 +761,25 @@ PLIST_ENTRY FASTCALL ExfInterlockedRemoveHeadList( LIST_ENTRY *list, KSPIN_LOCK 
 }
 
 /***********************************************************************
+ *           ExInterlockedInsertTailList  (NTOSKRNL.EXE.@)
+ */
+LIST_ENTRY * WINAPI ExInterlockedInsertTailList( LIST_ENTRY *list, LIST_ENTRY *entry,
+                                                 KSPIN_LOCK *lock )
+{
+    LIST_ENTRY *ret;
+    KIRQL irql;
+
+    TRACE("list %p, entry %p, lock %p.\n", list, entry, lock);
+
+    KeAcquireSpinLock( lock, &irql );
+    ret = list->Blink;
+    InsertTailList( list, entry );
+    KeReleaseSpinLock( lock, irql );
+
+    return ret != list ? ret : NULL;
+}
+
+/***********************************************************************
  *           ExInterlockedRemoveHeadList  (NTOSKRNL.EXE.@)
  */
 LIST_ENTRY * WINAPI ExInterlockedRemoveHeadList( LIST_ENTRY *list, KSPIN_LOCK *lock )
