@@ -1989,19 +1989,28 @@ ULONG WINAPI RtlWalkFrameChain( void **buffer, ULONG count, ULONG flags )
 
     RtlCaptureContext( &context );
 
-    for (i = 0; i < count; i++)
+    __TRY
     {
-        pc = context.Rip;
-        if ((context.ContextFlags & CONTEXT_UNWOUND_TO_CALL) && RtlIsEcCode( pc )) pc -= 4;
-        func = RtlLookupFunctionEntry( pc, &base, &table );
-        if (RtlVirtualUnwind2( UNW_FLAG_NHANDLER, base, pc, func, &context, NULL,
-                               &data, &frame, NULL, NULL, NULL, &handler, 0 ))
-            break;
-        if (!context.Rip) break;
-        if (!frame || !is_valid_frame( frame )) break;
-        if (context.Rsp == (ULONG_PTR)NtCurrentTeb()->Tib.StackBase) break;
-        if (i >= skip) buffer[num_entries++] = (void *)context.Rip;
+        for (i = 0; i < count; i++)
+        {
+            if (!is_valid_frame( context.Rsp )) break;
+            pc = context.Rip;
+            if ((context.ContextFlags & CONTEXT_UNWOUND_TO_CALL) && RtlIsEcCode( pc )) pc -= 4;
+            func = RtlLookupFunctionEntry( pc, &base, &table );
+            if (RtlVirtualUnwind2( UNW_FLAG_NHANDLER, base, pc, func, &context, NULL,
+                                   &data, &frame, NULL, NULL, NULL, &handler, 0 ))
+                break;
+            if (!context.Rip) break;
+            if (!frame || !is_valid_frame( frame )) break;
+            if (context.Rsp == (ULONG_PTR)NtCurrentTeb()->Tib.StackBase) break;
+            if (i >= skip) buffer[num_entries++] = (void *)context.Rip;
+        }
     }
+    __EXCEPT_ALL
+    {
+        num_entries = 0;
+    }
+    __ENDTRY
     return num_entries;
 }
 
