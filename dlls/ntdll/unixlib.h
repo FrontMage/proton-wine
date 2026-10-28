@@ -122,6 +122,9 @@ struct apply_arm64x_read_fixups_params
 
 #define ARM64X_READ_FIXUP_LIVE_NTDLL_VIEW 0x00000001
 
+/* PE and Unix ntdll must use the same configured ARM64EC bitmap coverage. */
+#define WINE_ARM64EC_ADDRESS_SPACE_LIMIT (((ULONGLONG)1 << WINE_ARM64EC_BITMAP_ADDRESS_BITS) - 0x10000)
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,

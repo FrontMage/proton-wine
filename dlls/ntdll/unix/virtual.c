@@ -318,15 +318,14 @@ static void *address_space_start = (void *)0x110000; /* keep DOS area clear */
 static void *address_space_start = (void *)0x10000;
 #endif
 #ifdef _WIN64
-#ifdef __ANDROID__
-static void *address_space_limit = (void *)0x7fffff0000;  /* top of the total available address space */
-static void *user_space_limit    = (void *)0x7fffff0000;  /* top of the user address space */
-static void *working_set_limit   = (void *)0x7fffff0000;  /* top of the current working set */
-#else
-static void *address_space_limit = (void *)0x7fffffff0000;  /* top of the total available address space */
-static void *user_space_limit    = (void *)0x7fffffff0000;  /* top of the user address space */
-static void *working_set_limit   = (void *)0x7fffffff0000;  /* top of the current working set */
+#if defined(__ANDROID__) && WINE_ARM64EC_BITMAP_ADDRESS_BITS != 39
+# error Android ARM64EC bitmap must match the 39-bit allocator
+#elif !defined(__ANDROID__) && WINE_ARM64EC_BITMAP_ADDRESS_BITS != 47
+# error ARM64EC bitmap must match the 47-bit allocator
 #endif
+static void *address_space_limit = (void *)WINE_ARM64EC_ADDRESS_SPACE_LIMIT;  /* top of the total available address space */
+static void *user_space_limit    = (void *)WINE_ARM64EC_ADDRESS_SPACE_LIMIT;  /* top of the user address space */
+static void *working_set_limit   = (void *)WINE_ARM64EC_ADDRESS_SPACE_LIMIT;  /* top of the current working set */
 #else
 static void *address_space_limit = (void *)0xc0000000;
 static void *user_space_limit    = (void *)0x7fff0000;

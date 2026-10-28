@@ -1530,8 +1530,12 @@ __ASM_GLOBAL_FUNC( "#KiUserCallbackDispatcher",
  */
 BOOLEAN WINAPI RtlIsEcCode( ULONG_PTR ptr )
 {
-    const UINT64 *map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
-    ULONG_PTR page = ptr / page_size;
+    const UINT64 *map;
+    ULONG_PTR page;
+
+    if (ptr >> WINE_ARM64EC_BITMAP_ADDRESS_BITS) return FALSE;
+    map = (const UINT64 *)NtCurrentTeb()->Peb->EcCodeBitMap;
+    page = ptr / page_size;
     return (map[page / 64] >> (page & 63)) & 1;
 }
 
