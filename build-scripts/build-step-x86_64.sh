@@ -85,11 +85,11 @@ do
   if [ "$arg" == "--configure" ];
   then
     export PATCH_STATUS_PATH="${PATCH_STATUS_PATH:-$PWD/patch-status.tsv}"
-    if [ "${ANDROID_PATCHES_PREAPPLIED:-0}" != "1" ]; then
-      bash build-scripts/apply-android-patches-strict.sh
-    else
-      echo "Using an explicitly pre-applied Android source snapshot"
-    fi
+    case "${ANDROID_PATCHES_PREAPPLIED:-1}" in
+      0) bash build-scripts/apply-android-patches-strict.sh || exit $? ;;
+      1) echo "Using the pre-applied Android source snapshot" ;;
+      *) echo "ANDROID_PATCHES_PREAPPLIED must be 0 or 1" >&2; exit 1 ;;
+    esac
     ANDROID_PATCHES_PREAPPLIED=1
 
     ./configure \
@@ -149,7 +149,7 @@ do
       --without-xrender \
       --without-xshape \
       --without-xshm \
-      --without-xxf86vm
+      --without-xxf86vm || exit $?
 
     if [ "${ANDROID_PATCHES_PREAPPLIED:-0}" != "1" ]; then
     echo "Applying patches..."
