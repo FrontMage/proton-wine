@@ -235,6 +235,11 @@ static void fill_system_info( SYSTEM_INFO *si, const SYSTEM_BASIC_INFORMATION *b
  */
 void WINAPI DECLSPEC_HOTPATCH GetNativeSystemInfo( SYSTEM_INFO *si )
 {
+#ifdef __arm64ec__
+    /* Like GetSystemInfo, a 64-bit emulated caller sees its virtual CPU,
+     * not the raw ARM64 host information. */
+    GetSystemInfo( si );
+#else
     SYSTEM_BASIC_INFORMATION basic_info;
     SYSTEM_CPU_INFORMATION cpu_info;
 
@@ -258,6 +263,7 @@ void WINAPI DECLSPEC_HOTPATCH GetNativeSystemInfo( SYSTEM_INFO *si )
         return;
 
     fill_system_info( si, &basic_info, &cpu_info );
+#endif
 }
 
 

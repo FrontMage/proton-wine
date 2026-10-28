@@ -2396,6 +2396,26 @@ static void test_SystemInfo(void)
         ok(si.dwProcessorType == nsi.dwProcessorType,
            "Expected no difference for dwProcessorType, got %ld and %ld\n",
            si.dwProcessorType, nsi.dwProcessorType);
+        ok(si.dwPageSize == nsi.dwPageSize, "page sizes differ: %lu and %lu\n",
+           si.dwPageSize, nsi.dwPageSize);
+        ok(si.dwAllocationGranularity == nsi.dwAllocationGranularity,
+           "allocation granularities differ: %lu and %lu\n",
+           si.dwAllocationGranularity, nsi.dwAllocationGranularity);
+        ok(si.lpMinimumApplicationAddress == nsi.lpMinimumApplicationAddress,
+           "minimum addresses differ: %p and %p\n",
+           si.lpMinimumApplicationAddress, nsi.lpMinimumApplicationAddress);
+        ok(si.lpMaximumApplicationAddress == nsi.lpMaximumApplicationAddress,
+           "maximum addresses differ: %p and %p\n",
+           si.lpMaximumApplicationAddress, nsi.lpMaximumApplicationAddress);
+        ok(si.dwActiveProcessorMask == nsi.dwActiveProcessorMask,
+           "processor masks differ: %s and %s\n",
+           wine_dbgstr_longlong(si.dwActiveProcessorMask), wine_dbgstr_longlong(nsi.dwActiveProcessorMask));
+        ok(si.dwNumberOfProcessors == nsi.dwNumberOfProcessors,
+           "processor counts differ: %lu and %lu\n", si.dwNumberOfProcessors, nsi.dwNumberOfProcessors);
+        ok(si.wProcessorLevel == nsi.wProcessorLevel, "processor levels differ: %u and %u\n",
+           si.wProcessorLevel, nsi.wProcessorLevel);
+        ok(si.wProcessorRevision == nsi.wProcessorRevision, "processor revisions differ: %u and %u\n",
+           si.wProcessorRevision, nsi.wProcessorRevision);
     }
 }
 
