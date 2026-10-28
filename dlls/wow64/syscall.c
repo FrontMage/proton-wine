@@ -41,6 +41,52 @@ ULONG_PTR args_alignment = 0;
 ULONG_PTR highest_user_address = 0x7ffeffff;
 ULONG_PTR default_zero_bits = 0x7fffffff;
 
+/* A guest thread's address-wait alert must not be consumed by a native host
+ * wait on the same thread. Keep its signal and park on one auto-reset event.
+ * Like the native alert table, entries remain allocated for the process life.
+ * The native validator accepts block 4096 inclusively; reserve that extra
+ * pointer here so preserving its accepted TID range does not index past us. */
+static HANDLE *guest_alert_blocks[GUEST_ALERT_BLOCK_COUNT];
+
+NTSTATUS get_guest_alert_event( HANDLE tid, HANDLE *event )
+{
+    ULONG idx = (HandleToULong( tid ) >> 2) - 1, block = idx / GUEST_ALERT_BLOCK_SIZE;
+    HANDLE *entries, handle, previous;
+    NTSTATUS status;
+
+    if (!is_guest_alert_tid_valid( tid )) return STATUS_INVALID_CID;
+    entries = InterlockedCompareExchangePointer( (void **)&guest_alert_blocks[block], NULL, NULL );
+    if (!entries)
+    {
+        SIZE_T size = GUEST_ALERT_BLOCK_SIZE * sizeof(HANDLE);
+        void *ptr = NULL;
+
+        if ((status = NtAllocateVirtualMemory( GetCurrentProcess(), &ptr, 0, &size,
+                                               MEM_COMMIT, PAGE_READWRITE ))) return status;
+        entries = InterlockedCompareExchangePointer( (void **)&guest_alert_blocks[block], ptr, NULL );
+        if (entries)
+        {
+            size = 0;
+            NtFreeVirtualMemory( GetCurrentProcess(), &ptr, &size, MEM_RELEASE );
+        }
+        else entries = ptr;
+    }
+    idx %= GUEST_ALERT_BLOCK_SIZE;
+    handle = InterlockedCompareExchangePointer( &entries[idx], NULL, NULL );
+    if (!handle)
+    {
+        if ((status = NtCreateEvent( &handle, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE )))
+            return status;
+        if ((previous = InterlockedCompareExchangePointer( &entries[idx], handle, NULL )))
+        {
+            NtClose( handle );
+            handle = previous;
+        }
+    }
+    *event = handle;
+    return STATUS_SUCCESS;
+}
+
 typedef NTSTATUS (WINAPI *syscall_thunk)( UINT *args );
 
 static const syscall_thunk syscall_thunks[] =

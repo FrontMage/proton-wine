@@ -257,4 +257,15 @@ extern void put_section_image_info( SECTION_IMAGE_INFORMATION32 *info32,
 extern void put_vm_counters( VM_COUNTERS_EX32 *info32, const VM_COUNTERS_EX *info,
                              ULONG size );
 
+#define GUEST_ALERT_BLOCK_SIZE 16384
+#define GUEST_ALERT_BLOCK_COUNT 4097
+
+static inline BOOL is_guest_alert_tid_valid( HANDLE tid )
+{
+    ULONG idx = (HandleToULong( tid ) >> 2) - 1;
+    return idx / GUEST_ALERT_BLOCK_SIZE < GUEST_ALERT_BLOCK_COUNT;
+}
+
+extern NTSTATUS get_guest_alert_event( HANDLE tid, HANDLE *event );
+
 #endif /* __WOW64_PRIVATE_H */

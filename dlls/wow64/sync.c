@@ -1624,8 +1624,13 @@ NTSTATUS WINAPI wow64_NtWaitForAlertByThreadId( UINT *args )
 {
     const void *address = get_ptr( &args );
     const LARGE_INTEGER *timeout = get_ptr( &args );
+    HANDLE event;
+    NTSTATUS status;
 
-    return NtWaitForAlertByThreadId( address, timeout );
+    (void)address;  /* ignored by the native implementation */
+    if ((status = get_guest_alert_event( NtCurrentTeb()->ClientId.UniqueThread, &event ))) return status;
+    status = NtWaitForSingleObject( event, FALSE, timeout );
+    return status == STATUS_WAIT_0 ? STATUS_ALERTED : status;
 }
 
 

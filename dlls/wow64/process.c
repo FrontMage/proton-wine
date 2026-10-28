@@ -281,11 +281,29 @@ NTSTATUS WINAPI wow64_NtAlertMultipleThreadByThreadId( UINT *args )
     HANDLE handles_buf[256], *handles;
     unsigned int i;
 
-    if (count <= ARRAY_SIZE(handles_buf)) handles = handles_buf;
-    else                                  handles = Wow64AllocateTemp( count * sizeof(*handles) );
-    for (i = 0; i < count; ++i) handles[i] = (HANDLE)(ULONG_PTR)handles_ptr[i];
+    (void)unk1;
+    (void)unk2;  /* ignored by the native implementation */
 
-    return NtAlertMultipleThreadByThreadId( handles, count, unk1, unk2 );
+    if (count <= ARRAY_SIZE(handles_buf)) handles = handles_buf;
+    else if (!(handles = Wow64AllocateTemp( count * sizeof(*handles) ))) return STATUS_NO_MEMORY;
+    /* Match native bulk validation before publishing any alert. Obtaining
+     * the events up front also makes allocation failure free of alert effects. */
+    for (i = 0; i < count; ++i) handles[i] = (HANDLE)(ULONG_PTR)handles_ptr[i];
+    for (i = 0; i < count; ++i)
+    {
+        if (!is_guest_alert_tid_valid( handles[i] )) return STATUS_INVALID_CID;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        NTSTATUS status = get_guest_alert_event( handles[i], &handles[i] );
+        if (status) return status;
+    }
+    for (i = 0; i < count; ++i)
+    {
+        NTSTATUS status = NtSetEvent( handles[i], NULL );
+        if (status) return status;
+    }
+    return STATUS_SUCCESS;
 }
 
 
@@ -318,8 +336,11 @@ NTSTATUS WINAPI wow64_NtAlertThread( UINT *args )
 NTSTATUS WINAPI wow64_NtAlertThreadByThreadId( UINT *args )
 {
     HANDLE tid = get_handle( &args );
+    HANDLE event;
+    NTSTATUS status;
 
-    return NtAlertThreadByThreadId( tid );
+    if ((status = get_guest_alert_event( tid, &event ))) return status;
+    return NtSetEvent( event, NULL );
 }
 
 
